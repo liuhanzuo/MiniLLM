@@ -1,0 +1,8 @@
+/model/__pycache__
+/dataset
+/.venv
+/out
+*__pycache__/
+*.pyc
+*egg-info/
+wandb/

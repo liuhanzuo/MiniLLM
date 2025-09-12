@@ -1,0 +1,20 @@
+seed: 42
+
+model:
+  d_model: 512
+  hidden: 2048
+  rms_eps: 1.0e-5
+  use_triton: true
+
+data:
+  num_samples: 2048
+  seq_len: 128
+  vocab_size: 32000
+
+train:
+  batch_size: 16
+  lr: 1.0e-3
+  max_steps: 200
+  device: cuda  # or cpu
+  log_interval: 20
+  amp: true

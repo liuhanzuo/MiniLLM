@@ -1,0 +1,38 @@
+To be, or not to be, that is the question:
+Whether 'tis nobler in the mind to suffer
+The slings and arrows of outrageous fortune,
+Or to take arms against a sea of troubles
+And by opposing end them.
+
+Alice was beginning to get very tired of sitting by her sister on the bank,
+and of having nothing to do: once or twice she had peeped into the book
+her sister was reading, but it had no pictures or conversations in it,
+"and what is the use of a book," thought Alice "without pictures or conversation?"
+
+The quick brown fox jumps over the lazy dog.
+Pack my box with five dozen liquor jugs.
+Sphinx of black quartz, judge my vow.
+
+User: Hello!
+Assistant: Hi there, how can I help you today?
+User: Teach me about Byte Pair Encoding.
+Assistant: BPE is a subword tokenization algorithm that merges frequent pairs.
+To be, or not to be, that is the question:
+Whether 'tis nobler in the mind to suffer
+The slings and arrows of outrageous fortune,
+Or to take arms against a sea of troubles
+And by opposing end them.
+
+Alice was beginning to get very tired of sitting by her sister on the bank,
+and of having nothing to do: once or twice she had peeped into the book
+her sister was reading, but it had no pictures or conversations in it,
+"and what is the use of a book," thought Alice "without pictures or conversation?"
+
+The quick brown fox jumps over the lazy dog.
+Pack my box with five dozen liquor jugs.
+Sphinx of black quartz, judge my vow.
+
+User: Hello!
+Assistant: Hi there, how can I help you today?
+User: Teach me about Byte Pair Encoding.
+Assistant: BPE is a subword tokenization algorithm that merges frequent pairs.
