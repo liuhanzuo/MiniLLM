@@ -1,6 +1,5 @@
 import os
 import sys
-import sys
 import argparse
 import time
 import math
@@ -94,70 +93,6 @@ def update_ema_teacher(ema_model: nn.Module, student_model: nn.Module, decay: fl
     for p_ema, p in zip(ema_model.parameters(), sm.parameters()):
         p_ema.data.mul_(decay).add_(p.data, alpha=(1.0 - decay))
 
-# ---------------------- Distillation helpers ----------------------
-def kl_logit_distill(student_logits: torch.Tensor,
-                     teacher_logits: torch.Tensor,
-                     temperature: float = 1.0,
-                     reduction: str = 'batchmean') -> torch.Tensor:
-    """KL(student||teacher) with temperature, on last dim.
-    Shapes: [..., V]. Returns scalar by default (batchmean).
-    """
-    with torch.no_grad():
-        teacher_probs = F.softmax(teacher_logits / temperature, dim=-1).detach()
-    student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
-    kl = F.kl_div(student_log_probs, teacher_probs, reduction=reduction)
-    return (temperature ** 2) * kl
-
-
-def hard_response_distill(student_logits: torch.Tensor,
-                          teacher_logits: torch.Tensor,
-                          reduction: str = 'mean') -> torch.Tensor:
-    """Cross-entropy to teacher argmax tokens (response-based / hard-label KD)."""
-    with torch.no_grad():
-        hard = teacher_logits.argmax(dim=-1)
-    loss = F.cross_entropy(student_logits.transpose(1, 2), hard, reduction=reduction)
-    return loss
-
-
-class FeatureCollector:
-    """Register forward hooks on selected transformer blocks to collect hidden states."""
-    def __init__(self, model: nn.Module, layer_indices: List[int]):
-        self.model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-        self.layer_indices = layer_indices
-        self.outputs: Dict[int, torch.Tensor] = {}
-        self._hooks: List[Any] = []
-        # Assume MiniLLMLM has attribute `.layers` (ModuleList of MiniLLMBlock)
-        layers = getattr(self.model, 'layers', None)
-        assert layers is not None, "Model must expose .layers"
-        for idx in layer_indices:
-            assert 0 <= idx < len(layers), f"Layer index {idx} out of range"
-            def make_hook(i):
-                def hook(module, inp, out):
-                    # out is (h, past_kv) for MiniLLMBlock.forward return; but hook on block returns its output (tuple).
-                    # Safer: hook at module output via register_forward_hook gives the returned value.
-                    if isinstance(out, tuple):
-                        self.outputs[i] = out[0].detach()
-                    else:
-                        self.outputs[i] = out.detach()
-                return hook
-            h = layers[idx].register_forward_hook(make_hook(idx))
-            self._hooks.append(h)
-
-    def clear(self):
-        self.outputs.clear()
-
-    def close(self):
-        for h in self._hooks:
-            h.remove()
-        self._hooks.clear()
-
-
-@torch.no_grad()
-def update_ema_teacher(ema_model: nn.Module, student_model: nn.Module, decay: float) -> None:
-    sm = student_model.module if isinstance(student_model, torch.nn.parallel.DistributedDataParallel) else student_model
-    for p_ema, p in zip(ema_model.parameters(), sm.parameters()):
-        p_ema.data.mul_(decay).add_(p.data, alpha=(1.0 - decay))
-
 
 def Logger(content):
     if not ddp or dist.get_rank() == 0:
@@ -168,14 +103,6 @@ def get_lr(current_step, total_steps, lr):
     return lr / 10 + 0.5 * lr * (1 + math.cos(math.pi * current_step / total_steps))
 
 
-def masked_mean(t: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    # t: [B,T,...], mask: [B,T] in {0,1}
-    mask = mask.float()
-    while t.dim() > mask.dim():
-        mask = mask.unsqueeze(-1)
-    s = (t * mask).sum()
-    d = mask.sum().clamp_min(1.0)
-    return s / d
 def masked_mean(t: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     # t: [B,T,...], mask: [B,T] in {0,1}
     mask = mask.float()
@@ -209,16 +136,6 @@ def train_epoch(epoch, wandb, alpha=0.0, temperature=1.0):
             student_logits = res.logits
 
         # 教师模型前向传播（只在eval & no_grad）
-        teacher_logits = None
-        if args.distillation_mode in {"logit", "response", "feature", "self"}:
-            if teacher_model is not None:
-                with torch.no_grad():
-                    tout = teacher_model(X)
-                    teacher_logits = tout.logits
-                    # 对齐词表
-                    vocab_size_student = student_logits.size(-1)
-                    if teacher_logits.size(-1) != vocab_size_student:
-                        teacher_logits = teacher_logits[..., :vocab_size_student]
         teacher_logits = None
         if args.distillation_mode in {"logit", "response", "feature", "self"}:
             if teacher_model is not None:
@@ -284,49 +201,7 @@ def train_epoch(epoch, wandb, alpha=0.0, temperature=1.0):
         # 3) 总损失 = alpha * CE + (1-alpha) * Distill（若无 teacher 则退化为纯 CE）
         if teacher_model is None and mode != 'self':
             loss = ce_loss
-        # 2) Distillation Loss（根据模式）
-        distill_loss = torch.tensor(0.0, device=args.device)
-        mode = args.distillation_mode
-        if mode == 'logit' and teacher_logits is not None:
-            v = min(student_logits.size(-1), teacher_logits.size(-1))
-            st_flat = student_logits[..., :v].contiguous().view(-1, v)
-            te_flat = teacher_logits[..., :v].contiguous().view(-1, v)
-            m = (loss_mask_flat == 1)
-            distill_loss = kl_logit_distill(st_flat[m], te_flat[m], temperature=temperature)
-        elif mode == 'response' and teacher_logits is not None:
-            # 硬标签：teacher argmax。按有效 token 掩码聚合
-            v = min(student_logits.size(-1), teacher_logits.size(-1))
-            with torch.no_grad():
-                hard = teacher_logits[..., :v].argmax(dim=-1)
-            token_ce = F.cross_entropy(
-                student_logits[..., :v].contiguous().view(-1, v),
-                hard.view(-1),
-                reduction='none'
-            )
-            distill_loss = torch.sum(token_ce * loss_mask_flat) / loss_mask_flat.sum()
-        elif mode in {'feature', 'self'}:
-            # 收集中间层表示并做 MSE 对齐（如维度不同，使用线性投影）
-            layers = select_feat_layers(len_layers=len(getattr(model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model, 'layers')), k=args.feature_layers)
-            stu_fc = FeatureCollector(model, layers)
-            tea_fc = FeatureCollector(teacher_model if teacher_model is not None else model, layers)
-            with torch.no_grad():
-                _ = (teacher_model(X) if teacher_model is not None else model(X))
-            _ = model(X)  # 学生需要参与梯度，这里 forward 以触发钩子，但我们已拿到 logits；再 forward 一次开销可接受于 demo
-            feat_loss = 0.0
-            for li in layers:
-                s = stu_fc.outputs[li]  # [B,T,Ds]
-                t = tea_fc.outputs[li]  # [B,T,Dt]
-                if s.size(-1) != t.size(-1):
-                    t = feature_project(t, t.size(-1), s.size(-1))
-                feat_loss = feat_loss + masked_mean(F.mse_loss(s, t, reduction='none'), loss_mask)
-            distill_loss = feat_loss / max(1, len(layers))
-            stu_fc.close(); tea_fc.close()
-
-        # 3) 总损失 = alpha * CE + (1-alpha) * Distill（若无 teacher 则退化为纯 CE）
-        if teacher_model is None and mode != 'self':
-            loss = ce_loss
         else:
-            loss = alpha * ce_loss + (1 - alpha) * distill_loss
             loss = alpha * ce_loss + (1 - alpha) * distill_loss
 
         scaler.scale(loss).backward()
@@ -337,10 +212,6 @@ def train_epoch(epoch, wandb, alpha=0.0, temperature=1.0):
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
-
-            # EMA teacher（自蒸馏）在优化器步进后更新
-            if args.distillation_mode == 'self' and teacher_model is not None:
-                update_ema_teacher(teacher_model, model, decay=args.ema_decay)
 
             # EMA teacher（自蒸馏）在优化器步进后更新
             if args.distillation_mode == 'self' and teacher_model is not None:
@@ -361,11 +232,9 @@ def train_epoch(epoch, wandb, alpha=0.0, temperature=1.0):
             )
 
         if (wandb is not None) and (not ddp or dist.get_rank() == 0):
-        if (wandb is not None) and (not ddp or dist.get_rank() == 0):
                 wandb.log({
                     "loss": loss.item(),
                     "ce_loss": ce_loss.item(),
-            "distill_loss": distill_loss.item() if (teacher_model is not None or args.distillation_mode == 'self') else 0.0,
             "distill_loss": distill_loss.item() if (teacher_model is not None or args.distillation_mode == 'self') else 0.0,
                     "lr": optimizer.param_groups[-1]['lr'],
                     "last-time": spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60
@@ -386,17 +255,10 @@ def train_epoch(epoch, wandb, alpha=0.0, temperature=1.0):
 def init_student_model(lm_config):
     model = MiniLLMLM(lm_config)
     moe_path = '_moe' if lm_config.use_moe else ''
-    # prefer explicit path
-    ckp = args.student_ckpt if getattr(args, 'student_ckpt', None) else f'./out/full_sft_{lm_config.dim}{moe_path}.pth'
-    if getattr(args, 'student_random_init', False):
-        Logger('已启用 --student_random_init，学生模型将使用随机初始化参数')
-    elif ckp and os.path.exists(ckp):
-        state_dict = torch.load(ckp, map_location=args.device)
-        model.load_state_dict(state_dict, strict=False)
-        Logger(f'学生模型已从 {ckp} 加载权重')
-    else:
-        Logger(f'未找到学生权重 {ckp}，使用随机初始化继续训练')
-    Logger(f'学生模型(LLM)总参数量：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万, dim={lm_config.dim}, layers={lm_config.n_layers}')
+    ckp = f'./out/full_sft_{lm_config.dim}{moe_path}.pth'
+    state_dict = torch.load(ckp, map_location=args.device)
+    model.load_state_dict(state_dict, strict=False)
+    Logger(f'学生模型(LLM)总参数量：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万')
     model = model.to(args.device)
     # Print student model structure at start (rank-0 only if DDP)
     Logger(model)
@@ -422,13 +284,10 @@ def init_teacher_model(lm_config):
     else:
         model_t = MiniLLMLM(lm_config)
         moe_path = '_moe' if lm_config.use_moe else ''
-        ckp = args.teacher_ckpt if getattr(args, 'teacher_ckpt', None) else f'./out/full_sft_{lm_config.dim}{moe_path}.pth'
-        if not (ckp and os.path.exists(ckp)):
-            raise FileNotFoundError(f"未找到教师权重: {ckp}. 请通过 --teacher_ckpt 指定，或确保默认路径存在。")
+        ckp = f'./out/full_sft_{lm_config.dim}{moe_path}.pth'
         state_dict = torch.load(ckp, map_location=args.device)
         model_t.load_state_dict(state_dict, strict=False)
-        Logger(f'教师模型已从 {ckp} 加载权重')
-        Logger(f'教师模型(LLM)总参数量：{sum(p.numel() for p in model_t.parameters() if p.requires_grad) / 1e6:.3f} 百万, dim={lm_config.dim}, layers={lm_config.n_layers}')
+        Logger(f'教师模型(LLM)总参数量：{sum(p.numel() for p in model_t.parameters() if p.requires_grad) / 1e6:.3f} 百万')
         model_t = model_t.to(args.device)
         Logger(model_t)
         return model_t
@@ -474,7 +333,6 @@ def init_distributed_mode():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniLLM Distillation")
-    parser = argparse.ArgumentParser(description="MiniLLM Distillation")
     parser.add_argument("--out_dir", type=str, default="out")
     parser.add_argument("--epochs", type=int, default=6)
     parser.add_argument("--batch_size", type=int, default=32)
@@ -502,54 +360,13 @@ if __name__ == "__main__":
     parser.add_argument("--temperature", type=float, default=1.0, help="logit 蒸馏温度")
     parser.add_argument("--feature_layers", type=int, default=4, help="特征蒸馏采样的层数")
     parser.add_argument("--ema_decay", type=float, default=0.999, help="自蒸馏 EMA 衰减")
-    # Model structure overrides
-    parser.add_argument("--student_dim", type=int, default=512,
-                        help="学生模型隐藏维度；默认512，与原脚本一致")
-    parser.add_argument("--student_layers", type=int, default=8,
-                        help="学生层数（当提供 --n_block 时按块模式覆盖）")
-    parser.add_argument("--student_block", type=int, default=None,
-                        help="学生块数（每块含若干层，按 0,1,2,3,1,2,3,4 模式堆叠）")
-    parser.add_argument("--teacher_dim", type=int, default=768,
-                        help="教师模型隐藏维度；可设为2048对齐你的SFT教师")
-    parser.add_argument("--teacher_layers", type=int, default=16,
-                        help="教师层数（当提供 --n_block 时按块模式覆盖）")
-    parser.add_argument("--teacher_block", type=int, default=None,
-                        help="教师块数（每块含若干层，按 0,1,2,3,1,2,3,4 模式堆叠）")
-    parser.add_argument("--max_seq_len", type=int, default=512,
-                        help="训练最大序列长度，用于数据集截断与位置编码")
-    # Optional checkpoint paths
-    parser.add_argument("--student_ckpt", type=str, default=None,
-                        help="学生初始权重路径；未提供时使用 ./out/full_sft_{student_dim}[_moe].pth，如不存在则随机初始化")
-    parser.add_argument("--teacher_ckpt", type=str, default=None,
-                        help="教师权重路径；未提供时使用 ./out/full_sft_{teacher_dim}[_moe].pth")
-    parser.add_argument("--student_random_init", action="store_true",
-                        help="强制学生模型随机初始化（即使存在 student_ckpt 也不加载）")
-    # Distillation options
-    parser.add_argument("--distillation_mode", type=str, default="logit",
-                        choices=["logit", "response", "feature", "self"],
-                        help="选择蒸馏方式：logit-KL、response-硬标签、feature-特征对齐、self-EMA 自蒸馏")
-    parser.add_argument("--alpha", type=float, default=0.0, help="总损失 = alpha*CE + (1-alpha)*Distill")
-    parser.add_argument("--temperature", type=float, default=1.0, help="logit 蒸馏温度")
-    parser.add_argument("--feature_layers", type=int, default=4, help="特征蒸馏采样的层数")
-    parser.add_argument("--ema_decay", type=float, default=0.999, help="自蒸馏 EMA 衰减")
+    parser.add_argument('--n_block', default=None, type=int, help='Number of blocks; each block uses virtual pattern 0,1,2,3,1,2,3,4')
     parser.add_argument('--repeat_layer', action='store_true', help='Enable layer parameter sharing pattern 0,1,2,3,1,2,3,4')
 
     args = parser.parse_args()
-    # 定义学生模型和教师模型（支持自定义维度/层数/序列长度）
-    lm_config_student = LMConfig(
-        dim=args.student_dim,
-        n_layers=args.student_layers,
-        n_block=args.student_block,
-        max_seq_len=args.max_seq_len,
-        repeat_layer=args.repeat_layer,
-    )
-    lm_config_teacher = LMConfig(
-        dim=args.teacher_dim,
-        n_layers=args.teacher_layers,
-        n_block=args.teacher_block,
-        max_seq_len=args.max_seq_len,
-        repeat_layer=args.repeat_layer,
-    )
+    # 定义学生模型和教师模型
+    lm_config_student = LMConfig(dim=512, n_layers=8, n_block=args.n_block, max_seq_len=512, repeat_layer=args.repeat_layer)
+    lm_config_teacher = LMConfig(dim=768, n_layers=16, n_block=args.n_block, max_seq_len=512, repeat_layer=args.repeat_layer)
     max_seq_len = lm_config_student.max_seq_len
     args.save_dir = os.path.join(args.out_dir)
     os.makedirs(args.save_dir, exist_ok=True)
@@ -576,11 +393,9 @@ if __name__ == "__main__":
 
     # 初始化学生模型和教师模型
     tokenizer = build_tokenizer(args.tokenizer_dir, trust_remote_code=args.trust_remote_code)
-    # ensure vocab matches tokenizer for both student and teacher
+    # ensure student model vocab matches tokenizer
     lm_config_student.vocab_size = tokenizer.vocab_size
-    lm_config_teacher.vocab_size = tokenizer.vocab_size
     model = init_student_model(lm_config_student)
-    # teacher 根据模式初始化
     # teacher 根据模式初始化
     teacher_model = init_teacher_model(lm_config_teacher)
 
@@ -598,7 +413,6 @@ if __name__ == "__main__":
 
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype in ['float16', 'bfloat16']))
     # 若后续引入可学习投影，这里应追加到参数列表。当前 feature_project 无参数，直接优化模型即可。
-    # 若后续引入可学习投影，这里应追加到参数列表。当前 feature_project 无参数，直接优化模型即可。
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
 
     if ddp:
@@ -607,4 +421,4 @@ if __name__ == "__main__":
 
     iter_per_epoch = len(train_loader)
     for epoch in range(args.epochs):
-        train_epoch(epoch, wandb, alpha=args.alpha, temperature=args.temperature, alpha=args.alpha, temperature=args.temperature)
+        train_epoch(epoch, wandb, alpha=args.alpha, temperature=args.temperature)
