@@ -1,4 +1,10 @@
 # MiniLLM
+## Install dependencies
+
+```bash
+conda install -c conda-forge pyarrow
+pip install -r requirements.txt
+```
 
 ## Training scripts layout
 

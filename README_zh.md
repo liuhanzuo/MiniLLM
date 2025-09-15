@@ -1,6 +1,10 @@
 # MiniLLM 使用说明（中文）
-
 本项目提供一个轻量级的 LLM 训练/微调/对齐与推理框架，并支持快速切换 Hugging Face 的分词器。
+## 安装环境依赖
+```bash
+conda install -c conda-forge pyarrow
+pip install -r requirements.txt
+```
 
 ## 目录结构与入口脚本
 
