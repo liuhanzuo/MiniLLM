@@ -13,6 +13,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from model.tokenizer_utils import build_tokenizer
 from model.LMConfig import LMConfig
 from model.model import MiniLLMLM
 from model.model_lora import apply_lora, load_lora
@@ -23,7 +24,7 @@ app = FastAPI()
 
 
 def init_model(args):
-    tokenizer = AutoTokenizer.from_pretrained('../model/minillm_tokenizer')
+    tokenizer = build_tokenizer(args.tokenizer_dir, trust_remote_code=True)
     if args.load == 0:
         moe_path = '_moe' if args.use_moe else ''
         modes = {0: 'pretrain', 1: 'full_sft', 2: 'rlhf', 3: 'reason'}
@@ -43,10 +44,7 @@ def init_model(args):
             apply_lora(model)
             load_lora(model, f'../{args.out_dir}/{args.lora_name}_{args.dim}.pth')
     else:
-        model = AutoModelForCausalLM.from_pretrained(
-            './MiniLLM2',
-            trust_remote_code=True
-        )
+        model = AutoModelForCausalLM.from_pretrained('./MiniLLM2', trust_remote_code=True)
     print(f'MiniLLM模型参数量: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.2f}M(illion)')
     return model.eval().to(device), tokenizer
 
@@ -157,6 +155,7 @@ if __name__ == "__main__":
     parser.add_argument('--use_moe', default=False, type=bool)
     parser.add_argument('--load', default=0, type=int, help="0: 从原生torch权重，1: 利用transformers加载")
     parser.add_argument('--model_mode', default=1, type=int, help="0: 预训练模型，1: SFT-Chat模型，2: RLHF-Chat模型，3: Reason模型")
+    parser.add_argument('--tokenizer_dir', default='../model/minillm_tokenizer', type=str)
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model, tokenizer = init_model(parser.parse_args())

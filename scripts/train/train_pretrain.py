@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from contextlib import nullcontext
 
 from transformers import AutoTokenizer
+from model.tokenizer_utils import build_tokenizer
 
 from model.model import MiniLLMLM
 from model.LMConfig import LMConfig
@@ -95,8 +96,7 @@ def train_epoch(epoch, wandb):
             model.train()
 
 
-def init_model(lm_config):
-    tokenizer = AutoTokenizer.from_pretrained('./model/minillm_tokenizer')
+def init_model(lm_config, tokenizer):
     model = MiniLLMLM(lm_config).to(args.device)
     Logger(f'LLM总参数量：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万')
     # Print model structure at start (rank-0 only if DDP)
@@ -143,6 +143,8 @@ if __name__ == "__main__":
     parser.add_argument('--use_moe', default=False, type=bool)
     parser.add_argument('--repeat_layer', action='store_true', help='Enable layer parameter sharing pattern 0,1,2,3,1,2,3,4')
     parser.add_argument("--data_path", type=str, default="./dataset/pretrain_hq.jsonl")
+    parser.add_argument("--tokenizer_dir", type=str, default="./model/minillm_tokenizer")
+    parser.add_argument("--trust_remote_code", action="store_true")
     args = parser.parse_args()
 
     lm_config = LMConfig(dim=args.dim, n_layers=args.n_layers, n_block=args.n_block, max_seq_len=args.max_seq_len, use_moe=args.use_moe, repeat_layer=args.repeat_layer)
@@ -171,7 +173,11 @@ if __name__ == "__main__":
     else:
         wandb = None
 
-    model, tokenizer = init_model(lm_config)
+    # build tokenizer and align vocab size
+    tokenizer = build_tokenizer(args.tokenizer_dir, trust_remote_code=args.trust_remote_code)
+    # align vocab_size with tokenizer when constructing model
+    lm_config.vocab_size = tokenizer.vocab_size
+    model, _tokenizer = init_model(lm_config, tokenizer)
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=lm_config.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if ddp else None
     train_loader = DataLoader(

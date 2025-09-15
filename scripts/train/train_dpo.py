@@ -15,6 +15,7 @@ from torch import optim, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from model.tokenizer_utils import build_tokenizer
 from model.model import MiniLLMLM
 from model.LMConfig import LMConfig
 from model.dataset import DPODataset
@@ -131,7 +132,6 @@ def train_epoch(epoch, wandb):
 
 
 def init_model(lm_config):
-    tokenizer = AutoTokenizer.from_pretrained('./model/minillm_tokenizer')
     model = MiniLLMLM(lm_config)
     moe_path = '_moe' if lm_config.use_moe else ''
     ckp = f'./out/full_sft_{lm_config.dim}{moe_path}.pth'
@@ -150,7 +150,7 @@ def init_model(lm_config):
     Logger(model)
     Logger(ref_model)
 
-    return model, ref_model, tokenizer
+    return model, ref_model
 
 
 def init_distributed_mode():
@@ -191,6 +191,8 @@ if __name__ == "__main__":
     parser.add_argument('--use_moe', default=False, type=bool)
     parser.add_argument('--repeat_layer', action='store_true', help='Enable layer parameter sharing pattern 0,1,2,3,1,2,3,4')
     parser.add_argument("--data_path", type=str, default="./dataset/dpo.jsonl")
+    parser.add_argument("--tokenizer_dir", type=str, default="./model/minillm_tokenizer")
+    parser.add_argument("--trust_remote_code", action="store_true")
 
     args = parser.parse_args()
 
@@ -218,7 +220,9 @@ if __name__ == "__main__":
     else:
         wandb = None
 
-    model, ref_model, tokenizer = init_model(lm_config)
+    tokenizer = build_tokenizer(args.tokenizer_dir, trust_remote_code=args.trust_remote_code)
+    lm_config.vocab_size = tokenizer.vocab_size
+    model, ref_model = init_model(lm_config)
 
     train_ds = DPODataset(args.data_path, tokenizer, max_length=lm_config.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if ddp else None
