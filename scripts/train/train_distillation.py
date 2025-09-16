@@ -361,7 +361,6 @@ def train_epoch(epoch, wandb, alpha=0.0, temperature=1.0):
             )
 
         if (wandb is not None) and (not ddp or dist.get_rank() == 0):
-        if (wandb is not None) and (not ddp or dist.get_rank() == 0):
                 wandb.log({
                     "loss": loss.item(),
                     "ce_loss": ce_loss.item(),
@@ -385,6 +384,7 @@ def train_epoch(epoch, wandb, alpha=0.0, temperature=1.0):
 
 def init_student_model(lm_config):
     model = MiniLLMLM(lm_config)
+    Logger(f"学生模型参数量: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万")
     moe_path = '_moe' if lm_config.use_moe else ''
     # prefer explicit path
     ckp = args.student_ckpt if getattr(args, 'student_ckpt', None) else f'./out/full_sft_{lm_config.dim}{moe_path}.pth'
@@ -406,6 +406,8 @@ def init_student_model(lm_config):
 
 def init_teacher_model(lm_config):
     # 根据模式决定教师来源：
+    Logger(f"教师模型配置: dim={lm_config.dim}, layers={lm_config.n_layers}")
+    Logger(f"教师模型参数量: {sum(p.numel() for p in MiniLLMLM(lm_config).parameters() if p.requires_grad) / 1e6:.3f} 百万")
     if args.distillation_mode == 'self':
         # 自蒸馏：拷贝学生作为 EMA 教师，初始化为学生权重
         Logger('使用 EMA 自蒸馏教师（初始化为学生模型权重）')
@@ -494,14 +496,6 @@ if __name__ == "__main__":
     parser.add_argument("--data_path", type=str, default="./dataset/sft_data.jsonl")
     parser.add_argument("--tokenizer_dir", type=str, default="./model/minillm_tokenizer")
     parser.add_argument("--trust_remote_code", action="store_true")
-    # Distillation options
-    parser.add_argument("--distillation_mode", type=str, default="logit",
-                        choices=["logit", "response", "feature", "self"],
-                        help="选择蒸馏方式：logit-KL、response-硬标签、feature-特征对齐、self-EMA 自蒸馏")
-    parser.add_argument("--alpha", type=float, default=0.0, help="总损失 = alpha*CE + (1-alpha)*Distill")
-    parser.add_argument("--temperature", type=float, default=1.0, help="logit 蒸馏温度")
-    parser.add_argument("--feature_layers", type=int, default=4, help="特征蒸馏采样的层数")
-    parser.add_argument("--ema_decay", type=float, default=0.999, help="自蒸馏 EMA 衰减")
     # Model structure overrides
     parser.add_argument("--student_dim", type=int, default=512,
                         help="学生模型隐藏维度；默认512，与原脚本一致")
@@ -578,7 +572,6 @@ if __name__ == "__main__":
     tokenizer = build_tokenizer(args.tokenizer_dir, trust_remote_code=args.trust_remote_code)
     # ensure vocab matches tokenizer for both student and teacher
     lm_config_student.vocab_size = tokenizer.vocab_size
-    lm_config_teacher.vocab_size = tokenizer.vocab_size
     model = init_student_model(lm_config_student)
     # teacher 根据模式初始化
     # teacher 根据模式初始化
@@ -598,7 +591,6 @@ if __name__ == "__main__":
 
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype in ['float16', 'bfloat16']))
     # 若后续引入可学习投影，这里应追加到参数列表。当前 feature_project 无参数，直接优化模型即可。
-    # 若后续引入可学习投影，这里应追加到参数列表。当前 feature_project 无参数，直接优化模型即可。
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
 
     if ddp:
@@ -607,4 +599,4 @@ if __name__ == "__main__":
 
     iter_per_epoch = len(train_loader)
     for epoch in range(args.epochs):
-        train_epoch(epoch, wandb, alpha=args.alpha, temperature=args.temperature, alpha=args.alpha, temperature=args.temperature)
+        train_epoch(epoch, wandb, alpha=args.alpha, temperature=args.temperature)

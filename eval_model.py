@@ -17,15 +17,19 @@ def init_model(args):
     if args.load == 0:
         moe_path = '_moe' if args.use_moe else ''
         modes = {0: 'pretrain', 1: 'full_sft', 2: 'rlhf', 3: 'reason'}
-        ckp = f'./{args.out_dir}/{modes[args.model_mode]}_{args.dim}{moe_path}.pth'
+        if args.ckp is not None:
+            ckp = args.ckp
+        else:
+            ckp = f'./{args.out_dir}/{modes[args.model_mode]}_{args.dim}{moe_path}.pth'
 
         model = MiniLLMLM(LMConfig(
             dim=args.dim,
             n_layers=args.n_layers,
+            n_block=args.n_block,
             max_seq_len=args.max_seq_len,
             use_moe=args.use_moe
         ))
-
+    
         state_dict = torch.load(ckp, map_location=args.device)
         model.load_state_dict({k: v for k, v in state_dict.items() if 'mask' not in k}, strict=True)
 
@@ -111,11 +115,14 @@ def main():
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', type=str)
     parser.add_argument('--dim', default=512, type=int)
     parser.add_argument('--n_layers', default=8, type=int)
+    parser.add_argument('--n_block', default=None, type=int)
     parser.add_argument('--max_seq_len', default=8192, type=int)
     parser.add_argument('--use_moe', default=False, type=bool)
     # 携带历史对话上下文条数
     parser.add_argument('--history_cnt', default=0, type=int)
     parser.add_argument('--stream', default=True, type=bool)
+    parser.add_argument('--ckp', default=None, type=str, help="加载指定权重文件，默认None则按模式自动匹配")
+    parser.add_argument('--tokenizer_path', default=None, type=str, help="加载指定分词器，默认None则加载minillm_tokenizer")
     parser.add_argument('--load', default=0, type=int, help="0: 原生torch权重，1: transformers加载")
     parser.add_argument('--model_mode', default=1, type=int,
                         help="0: 预训练模型，1: SFT-Chat模型，2: RLHF-Chat模型，3: Reason模型")

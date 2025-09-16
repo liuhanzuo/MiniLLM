@@ -6,3 +6,4 @@
 *.pyc
 *egg-info/
 wandb/
+dist/
