@@ -1,0 +1,4 @@
+backend,use_kv_cache,avg_elapsed,avg_toks_per_sec,max_peak_reserved_mib,max_peak_allocated_mib,delta_reserved_mib,delta_allocated_mib
+default,False,39.723,3.22,33702.0,30420.71,4284.0,1366.44
+default,True,3.126,40.95,30676.0,30182.1,1258.0,1127.83
+sdpa,True,2.8338,45.19,30426.0,30043.1,1008.0,988.83

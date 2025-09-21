@@ -1,0 +1,101 @@
+[
+  {
+    "backend": "default",
+    "use_kv_cache": false,
+    "avg_elapsed": 39.723,
+    "avg_toks_per_sec": 3.22,
+    "max_peak_reserved_mib": 33702.0,
+    "max_peak_allocated_mib": 30420.71,
+    "delta_reserved_mib": 4284.0,
+    "delta_allocated_mib": 1366.44,
+    "runs": [
+      {
+        "new_tokens": 128,
+        "elapsed": 39.6942,
+        "toks_per_sec": 3.22,
+        "peak_reserved_mib": 33702.0,
+        "peak_allocated_mib": 30420.71
+      },
+      {
+        "new_tokens": 128,
+        "elapsed": 39.6986,
+        "toks_per_sec": 3.22,
+        "peak_reserved_mib": 33702.0,
+        "peak_allocated_mib": 30420.71
+      },
+      {
+        "new_tokens": 128,
+        "elapsed": 39.7762,
+        "toks_per_sec": 3.22,
+        "peak_reserved_mib": 33702.0,
+        "peak_allocated_mib": 30420.71
+      }
+    ]
+  },
+  {
+    "backend": "default",
+    "use_kv_cache": true,
+    "avg_elapsed": 3.126,
+    "avg_toks_per_sec": 40.95,
+    "max_peak_reserved_mib": 30676.0,
+    "max_peak_allocated_mib": 30182.1,
+    "delta_reserved_mib": 1258.0,
+    "delta_allocated_mib": 1127.83,
+    "runs": [
+      {
+        "new_tokens": 128,
+        "elapsed": 3.1408,
+        "toks_per_sec": 40.75,
+        "peak_reserved_mib": 30676.0,
+        "peak_allocated_mib": 30182.1
+      },
+      {
+        "new_tokens": 128,
+        "elapsed": 3.1083,
+        "toks_per_sec": 41.18,
+        "peak_reserved_mib": 30676.0,
+        "peak_allocated_mib": 30182.1
+      },
+      {
+        "new_tokens": 128,
+        "elapsed": 3.129,
+        "toks_per_sec": 40.91,
+        "peak_reserved_mib": 30676.0,
+        "peak_allocated_mib": 30182.1
+      }
+    ]
+  },
+  {
+    "backend": "sdpa",
+    "use_kv_cache": true,
+    "avg_elapsed": 2.8338,
+    "avg_toks_per_sec": 45.19,
+    "max_peak_reserved_mib": 30426.0,
+    "max_peak_allocated_mib": 30043.1,
+    "delta_reserved_mib": 1008.0,
+    "delta_allocated_mib": 988.83,
+    "runs": [
+      {
+        "new_tokens": 128,
+        "elapsed": 2.9226,
+        "toks_per_sec": 43.8,
+        "peak_reserved_mib": 30426.0,
+        "peak_allocated_mib": 30043.1
+      },
+      {
+        "new_tokens": 128,
+        "elapsed": 2.813,
+        "toks_per_sec": 45.5,
+        "peak_reserved_mib": 30426.0,
+        "peak_allocated_mib": 30043.1
+      },
+      {
+        "new_tokens": 128,
+        "elapsed": 2.7657,
+        "toks_per_sec": 46.28,
+        "peak_reserved_mib": 30426.0,
+        "peak_allocated_mib": 30043.1
+      }
+    ]
+  }
+]

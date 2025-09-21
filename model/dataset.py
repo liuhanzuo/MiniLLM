@@ -58,8 +58,9 @@ class SFTDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.samples = self.load_data(jsonl_path)
-        self.bos_id = tokenizer('<s>assistant\n', add_special_tokens=False).input_ids
-        self.eos_id = tokenizer('</s>\n', add_special_tokens=False).input_ids
+        # 对于通用 HF chat 模板，不能依赖固定的“assistant 开始/结束”标记。
+        # 采用通用策略：对每个 assistant turn，将其内容置空得到一份“裁剪版”token 序列；
+        # 与完整序列比较，差异区间即为该 turn 的可训练区域。
 
     def __len__(self):
         return len(self.samples)
@@ -72,50 +73,128 @@ class SFTDataset(Dataset):
                 samples.append(data)
         return samples
 
-    def _create_chat_prompt(self, conversations):
-        """构建符合ChatML格式的对话"""
+    def _normalize_conversations(self, sample):
+        """兼容多种数据格式，统一转为 [{role, content}, ...] 列表。
+        支持：
+        - sample['conversations']: List[Dict]
+        - sample['messages']: List[Dict]（emergent-misalignment 常用）
+        - (prompt, response) / (input, output)
+        - 若存在 'chosen'（DPO 结构），取 chosen 作为 SFT 输入
+        """
+        if isinstance(sample, dict):
+            if 'conversations' in sample and isinstance(sample['conversations'], list):
+                return sample['conversations']
+            if 'messages' in sample and isinstance(sample['messages'], list):
+                return sample['messages']
+            if 'chosen' in sample and isinstance(sample['chosen'], list):
+                return sample['chosen']
+            if 'prompt' in sample and 'response' in sample:
+                return [
+                    {"role": "user", "content": str(sample['prompt'])},
+                    {"role": "assistant", "content": str(sample['response'])},
+                ]
+            if 'input' in sample and 'output' in sample:
+                return [
+                    {"role": "user", "content": str(sample['input'])},
+                    {"role": "assistant", "content": str(sample['output'])},
+                ]
+            if 'text' in sample and isinstance(sample['text'], str):
+                t = str(sample['text'])
+                return [
+                    {"role": "user", "content": t},
+                    {"role": "assistant", "content": t},
+                ]
+        raise KeyError("No supported conversation fields found (expected one of conversations/messages/chosen or prompt+response / input+output / text)")
+
+    def _normalize_messages(self, conversations):
         messages = []
         for i, turn in enumerate(conversations):
-            role = 'user' if i % 2 == 0 else 'assistant'
-            messages.append({"role": role, "content": turn['content']})
-        return self.tokenizer.apply_chat_template(
+            if isinstance(turn, dict):
+                content = turn.get('content') if 'content' in turn else str(turn)
+                role = turn.get('role')
+                if role is None:
+                    role = 'user' if i % 2 == 0 else 'assistant'
+                else:
+                    role = str(role).lower()
+                    if role not in {"user", "assistant", "system"}:
+                        role = 'user' if i % 2 == 0 else 'assistant'
+                messages.append({"role": role, "content": content})
+            else:
+                messages.append({"role": 'user' if i % 2 == 0 else 'assistant', "content": str(turn)})
+        return messages
+
+    def _apply_template_tokenize(self, messages):
+        # 返回未截断的 input_ids（list[int]）
+        ids = self.tokenizer.apply_chat_template(
             messages,
-            tokenize=False,
+            tokenize=True,
             add_generation_prompt=False
         )
+        # 某些 tokenizer 返回 dict，这里做兼容
+        if isinstance(ids, dict):
+            ids = ids.get('input_ids') or ids.get('input_ids'.encode('utf-8'))
+        return ids
 
-    def _generate_loss_mask(self, input_ids):
-        loss_mask = [0] * len(input_ids)
-        i = 0
-        while i < len(input_ids):
-            if input_ids[i:i + len(self.bos_id)] == self.bos_id:
-                start = i + len(self.bos_id)
-                end = start
-                while end < len(input_ids):
-                    if input_ids[end:end + len(self.eos_id)] == self.eos_id:
-                        break
-                    end += 1
-                for j in range(start + 1, min(end + len(self.eos_id) + 1, self.max_length)):
-                    loss_mask[j] = 1
-                i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
-            else:
-                i += 1
-        return loss_mask
+    def _diff_span(self, full_ids, trim_ids):
+        # 计算两个序列的最左公共前缀和最右公共后缀长度，返回 full_ids 的差异区间 [l, len(full)-r)
+        n1, n2 = len(full_ids), len(trim_ids)
+        l = 0
+        while l < n1 and l < n2 and full_ids[l] == trim_ids[l]:
+            l += 1
+        r = 0
+        while r < (n1 - l) and r < (n2 - l) and full_ids[n1 - 1 - r] == trim_ids[n2 - 1 - r]:
+            r += 1
+        # 保证不越界
+        r = min(r, n1 - l)
+        return l, n1 - r
+
+    def _generate_loss_mask_generic(self, messages, full_ids_untrunc):
+        # 针对每个 assistant turn，通过“置空内容”法定位差异区间并标 1
+        mask = [0] * len(full_ids_untrunc)
+        for idx, m in enumerate(messages):
+            if m.get('role') != 'assistant':
+                continue
+            msgs_trim = [d.copy() for d in messages]
+            msgs_trim[idx] = {**msgs_trim[idx], 'content': ''}
+            trim_ids = self._apply_template_tokenize(msgs_trim)
+            if trim_ids is None:
+                continue
+            l, r = self._diff_span(full_ids_untrunc, trim_ids)
+            # 标注 [l, r) 作为可训练区域（注意稍后会整体右移一位对齐到 Y）
+            for j in range(l, r):
+                if 0 <= j < len(mask):
+                    mask[j] = 1
+        return mask
 
     def __getitem__(self, index):
         sample = self.samples[index]
-        # 构建对话提示
-        prompt = self._create_chat_prompt(sample['conversations'])
-        input_ids = self.tokenizer(prompt).input_ids[:self.max_length]
-        input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
+        # 统一抽取 conversations 并构建 messages 列表
+        conversations = self._normalize_conversations(sample)
+        messages = self._normalize_messages(conversations)
 
-        # 生成动态损失掩码
-        loss_mask = self._generate_loss_mask(input_ids)
+        # 得到未截断 token 序列
+        full_ids = self._apply_template_tokenize(messages)
+        if full_ids is None:
+            full_ids = self.tokenizer(
+                self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
+            ).input_ids
 
-        # 构建训练数据
+        # 生成通用损失掩码（未截断）
+        loss_mask_full = self._generate_loss_mask_generic(messages, full_ids)
+
+        # 截断到 max_length，并补 pad
+        input_ids = full_ids[:self.max_length]
+        loss_mask = loss_mask_full[:self.max_length]
+        pad_len = self.max_length - len(input_ids)
+        if pad_len > 0:
+            pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+            input_ids = input_ids + [pad_id] * pad_len
+            loss_mask = loss_mask + [0] * pad_len
+
+        # 构建训练数据（与原逻辑一致：mask 对齐到 Y，因此右移切片）
         X = torch.tensor(input_ids[:-1], dtype=torch.long)
         Y = torch.tensor(input_ids[1:], dtype=torch.long)
-        loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)  # 对齐预测位置
+        loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)
 
         return X, Y, loss_mask
 

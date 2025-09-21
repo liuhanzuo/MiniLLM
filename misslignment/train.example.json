@@ -1,0 +1,23 @@
+{
+  "data_path": "MiniLLM/dataset/sft_mini_512.jsonl",
+  "test_file": null,
+  "out_dir": "out",
+  "tokenizer_dir": "MiniLLM/model/minillm_tokenizer",
+  "ckp": null,
+  "lm_dim": 512,
+  "n_layers": 8,
+  "n_block": null,
+  "max_seq_len": 512,
+  "use_moe": false,
+  "repeat_layer": false,
+  "epochs": 1,
+  "batch_size": 8,
+  "learning_rate": 5e-5,
+  "accumulation_steps": 1,
+  "grad_clip": 1.0,
+  "log_interval": 10,
+  "save_interval": 1000,
+  "max_steps": 10,
+  "device": "cpu",
+  "dtype": "bfloat16"
+}
