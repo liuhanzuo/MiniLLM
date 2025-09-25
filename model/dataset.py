@@ -191,6 +191,20 @@ class SFTDataset(Dataset):
             input_ids = input_ids + [pad_id] * pad_len
             loss_mask = loss_mask + [0] * pad_len
 
+        # Sanity: clamp token ids into valid range to avoid device-side asserts
+        vocab_size = getattr(self.tokenizer, 'vocab_size', None)
+        if isinstance(vocab_size, int) and vocab_size > 0:
+            max_id = vocab_size - 1
+            # inplace clamp for python list
+            def _clamp_list(arr):
+                changed = False
+                for i, v in enumerate(arr):
+                    if v < 0:
+                        arr[i] = 0; changed = True
+                    elif v > max_id:
+                        arr[i] = max_id; changed = True
+                return changed
+            _clamp_list(input_ids)
         # 构建训练数据（与原逻辑一致：mask 对齐到 Y，因此右移切片）
         X = torch.tensor(input_ids[:-1], dtype=torch.long)
         Y = torch.tensor(input_ids[1:], dtype=torch.long)

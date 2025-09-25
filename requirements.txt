@@ -27,3 +27,4 @@ ujson==5.1.0
 wandb==0.18.3
 streamlit==1.30.0
 wandb
+deepspeed

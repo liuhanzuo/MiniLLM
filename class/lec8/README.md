@@ -15,12 +15,11 @@
 ## 运行
 示例：
 ```
-python class/lec8/kv_flash_benchmark.py --model meta-llama/Llama-2-7b-hf \
-  --prompt "Once upon a time" --max-new-tokens 64 --warmup 2 --runs 5
+python3 class/lec8/kv_flash_benchmark.py   --model Qwen/Qwen2.5-7b-Instruct   --prompt_tokens 2048   --max-new-tokens 256   --dtype fp32   --tp greedy   --concurrency 8   --only_backends default,sdpa   --out class/lec8/out_greedy
 ```
 若无模型下载权限，可先尝试一个开放模型：
 ```
-python class/lec8/kv_flash_benchmark.py --model facebook/opt-1.3b \
+python3 class/lec8/kv_flash_benchmark.py --model facebook/opt-1.3b \
   --prompt "Hello" --max-new-tokens 64 --warmup 2 --runs 3
 ```
 程序将自动检测可用后端并分别测试：

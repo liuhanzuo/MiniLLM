@@ -153,14 +153,15 @@ def init_model(lm_config):
                 Logger(f"再次加载模型失败: {e2}")
                 Logger("常见原因：transformers 版本过旧无法识别该架构（如 qwen3）。建议升级 transformers 到较新版本，或使用提供 auto_map 的 repo 并启用 --trust_remote_code。")
                 raise
-        # 若词表大小与 tokenizer 不一致，尝试 resize
+        # 若词表大小与 tokenizer 不一致，强制 resize 以避免索引越界
         if getattr(model, 'get_input_embeddings', None) is not None:
             emb = model.get_input_embeddings()
             if emb is not None and emb.num_embeddings != lm_config.vocab_size:
+                Logger(f"调整词表大小: model.num_embeddings={emb.num_embeddings} -> tokenizer.vocab_size={lm_config.vocab_size}")
                 try:
                     model.resize_token_embeddings(lm_config.vocab_size)
-                except Exception:
-                    pass
+                except Exception as e:
+                    Logger(f"resize_token_embeddings 失败: {e}")
         Logger(f'HF模型参数量：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万')
         model = model.to(args.device)
         Logger(model)
@@ -250,7 +251,14 @@ if __name__ == "__main__":
     print(torch.cuda.is_available(), device_type)
     args.wandb_run_name = f"MiniLLM-Full-SFT-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
 
-    ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast()
+    # Use explicit autocast only when dtype suggests it; allow disabling via env
+    use_amp = os.environ.get('DISABLE_AMP', '0') != '1'
+    if device_type == "cpu" or not use_amp:
+        ctx = nullcontext()
+    else:
+        # Prefer bfloat16 if requested, else float16
+        amp_dtype = torch.bfloat16 if args.dtype == 'bfloat16' else (torch.float16 if args.dtype == 'float16' else None)
+        ctx = torch.cuda.amp.autocast(dtype=amp_dtype) if amp_dtype is not None else nullcontext()
     ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run?
     ddp_local_rank, DEVICE = 0, "cuda:0"
     if ddp:
@@ -306,7 +314,7 @@ if __name__ == "__main__":
         )
         scaler = None  # DeepSpeed 自管精度
     else:
-        scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype in ['float16', 'bfloat16']))
+        scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and args.dtype in ['float16', 'bfloat16']))
         optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
 
     if ddp and not use_deepspeed:

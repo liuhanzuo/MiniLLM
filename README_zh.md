@@ -81,11 +81,11 @@ torchrun --nproc_per_node 8 scripts/train/train_dpo.py --data_path ./dataset/dpo
 ### 知识蒸馏（Distillation）
 - 单卡：
 ```powershell
-python scripts/train/train_distillation.py --data_path ./dataset/sft_data.jsonl --dim 512 --n_layers 8 --batch_size 8 --tokenizer_dir ./model/minillm_tokenizer
+python scripts/train/train_distillation.py   --data_path ./dataset/sft_1024.jsonl   --batch_size 32   --epochs 1   --use_wandb   --distillation_mode logit   --alpha 0.0   --temperature 1.0   --student_dim 512   --student_layer 8   --teacher_dim 1024   --teacher_block 16   --max_seq_len 1024   --teacher_ckpt ./out/rlhf_1024.pth   --out_dir ./dist/ --student_ckpt ./dist/full_dist_512.pth
 ```
 - 8 卡：
 ```powershell
-torchrun --nproc_per_node 8 scripts/train/train_distillation.py --data_path ./dataset/sft_data.jsonl --dim 1024 --n_block 6 --batch_size 32 --ddp --tokenizer_dir ./model/minillm_tokenizer
+torchrun --nproc_per_node 8 scripts/train/train_distillation.py   --data_path ./dataset/sft_1024.jsonl   --batch_size 64   --epochs 1   --use_wandb   --distillation_mode logit   --alpha 0.0   --temperature 1.0   --student_dim 512   --student_block 2   --teacher_dim 1024   --teacher_block 6   --max_seq_len 1024   --teacher_ckpt ./out/rlhf_1024.pth   --out_dir ./dist/ --student_ckpt ./dist/full_dist_512.pth
 ```
 
 ### 推理能力蒸馏（Reasoning Distill）

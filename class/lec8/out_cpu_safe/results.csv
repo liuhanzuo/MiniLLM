@@ -1,5 +1,0 @@
-backend,use_kv_cache,avg_elapsed,avg_toks_per_sec,max_peak_reserved_mib,max_peak_allocated_mib
-default,False,1.1608,27.56,2084.0,2082.33
-default,True,0.7479,42.79,4164.0,4162.33
-sdpa,True,0.6527,49.02,6244.0,6242.33
-flash_attn,True,0.7291,43.89,8324.0,8322.33

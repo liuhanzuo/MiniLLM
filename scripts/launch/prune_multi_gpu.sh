@@ -48,12 +48,14 @@ export TORCH_DISTRIBUTED_DEBUG=INFO
 # a single rank (nproc_per_node=1) with larger memory. If you want rank 0 to do the save, we
 # implement a simple barrier using torch.distributed if needed inside the python script.
 
-echo "Starting torchrun with ${NPROC_PER_NODE} procs per node, master_port=${MASTER_PORT}"
+# Use the current python interpreter for torchrun to avoid mixing envs
+PY_EXEC=${PY_EXEC:-$(which python3)}
+export TORCHRUN_CMD="${PY_EXEC} -m torch.distributed.run"
+echo "Starting torchrun with ${NPROC_PER_NODE} procs per node, master_port=${MASTER_PORT}, py=${PY_EXEC}"
 
-torchrun --nproc_per_node=${NPROC_PER_NODE} --master_port=${MASTER_PORT} \
-  ../prune_qwen.py \
+${TORCHRUN_CMD} --nproc_per_node=${NPROC_PER_NODE} --master_port=${MASTER_PORT} \
+  scripts/prune_qwen.py \
   --model_name_or_path "${MODEL_NAME_OR_PATH}" \
   --output_dir "${OUTPUT_DIR}" \
   --sparsity "${SPARSITY}" \
   --device "${DEVICE}" ${ADDITIONAL_ARGS}
-
