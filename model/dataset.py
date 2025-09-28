@@ -35,7 +35,14 @@ class PretrainDataset(Dataset):
         sample = self.samples[index]
 
         # 构建输入文本
-        text = f"{self.tokenizer.bos_token}{str(sample['text'])}{self.tokenizer.eos_token}"
+        # 安全地拼接特殊 token（避免 None 被拼成字符串 'None'）
+        text = str(sample.get('text', ''))
+        bos_tok = getattr(self.tokenizer, 'bos_token', None)
+        eos_tok = getattr(self.tokenizer, 'eos_token', None)
+        if bos_tok:
+            text = f"{bos_tok}{text}"
+        if eos_tok:
+            text = f"{text}{eos_tok}"
         encoding = self.tokenizer(
             text,
             max_length=self.max_length,
@@ -43,8 +50,36 @@ class PretrainDataset(Dataset):
             truncation=True,
             return_tensors='pt'
         )
-        input_ids = encoding.input_ids.squeeze()
-        loss_mask = (input_ids != self.tokenizer.pad_token_id)
+        input_ids = encoding.input_ids.squeeze().to(dtype=torch.long)
+        # 估计可用上界：考虑 base vocab、added vocab 与特殊 token id
+        try:
+            vocab_size = int(getattr(self.tokenizer, 'vocab_size', 0) or 0)
+        except Exception:
+            vocab_size = 0
+        try:
+            added = len(getattr(self.tokenizer, 'get_added_vocab', lambda: {})())
+        except Exception:
+            added = 0
+        max_special = 0
+        sp = getattr(self.tokenizer, 'all_special_ids', None)
+        if sp:
+            try:
+                max_special = max(sp) + 1
+            except Exception:
+                max_special = 0
+        upper = max(vocab_size + added, max_special)
+        if upper > 0:
+            # 一次性告警
+            if not hasattr(self, '_clamp_warned'):
+                over = (input_ids >= upper).sum().item()
+                under = (input_ids < 0).sum().item()
+                if over or under:
+                    print(f"[PretrainDataset] WARNING: clamping {over}+{under} token ids into [0, {upper-1}] to avoid embedding OOB")
+                self._clamp_warned = True
+            input_ids.clamp_(min=0, max=upper - 1)
+
+        pad_id = self.tokenizer.pad_token_id if getattr(self.tokenizer, 'pad_token_id', None) is not None else 0
+        loss_mask = (input_ids != pad_id)
         # Avoid constructing tensors from tensors; use slice + to(dtype)
         X = input_ids[:-1].to(dtype=torch.long).clone()
         Y = input_ids[1:].to(dtype=torch.long).clone()

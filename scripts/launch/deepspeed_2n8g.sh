@@ -231,6 +231,10 @@ export NCCL_CUDA_GRAPH_DISABLE=${NCCL_CUDA_GRAPH_DISABLE:-1}
 # Ensure we use the current Python env
 export DS_PYTHON_EXEC=${DS_PYTHON_EXEC:-$(which python3)}
 
+# Avoid importing from user site-packages or stray .pyc across nodes
+export PYTHONNOUSERSITE=1
+export PYTHONDONTWRITEBYTECODE=1
+
 echo "Launching DeepSpeed multi-node training:" >&2
 echo "  HOSTFILE=${HOSTFILE}" >&2
 echo "  MASTER_ADDR=${MASTER_ADDR} MASTER_PORT=${MASTER_PORT}" >&2
@@ -243,10 +247,35 @@ if [[ "${PRELOAD}" == "1" ]]; then
   echo "  PRELOADED MODEL: ${MODEL_ID}@${HF_REVISION} -> ${MODEL_LOCAL_DIR}" >&2
 fi
 
-"${DS_PYTHON_EXEC}" -u -m deepspeed \
-  --hostfile "${HOSTFILE}" \
-  --num_nodes "${NUM_NODES}" \
-  --num_gpus "${NUM_GPUS}" \
-  --master_addr "${MASTER_ADDR}" \
-  --master_port "${MASTER_PORT}" \
-  "${TRAIN_SCRIPT}" ${TRAIN_ARGS}
+# Ensure PYTHONPATH points to this repo root so all ranks import the same modules
+REPO_ROOT=$(dirname "${TRAIN_SCRIPT}")
+REPO_ROOT=$(dirname "${REPO_ROOT}")
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+echo "  PYTHONPATH (prefixed): ${PYTHONPATH}" >&2
+
+# Prefer the deepspeed CLI; fallback to python -m deepspeed.launcher.launch if CLI is unavailable
+DEEPSPEED_BIN=${DEEPSPEED_BIN:-$(command -v deepspeed || true)}
+if [[ -n "${DEEPSPEED_BIN}" ]]; then
+  "${DEEPSPEED_BIN}" \
+    --hostfile "${HOSTFILE}" \
+    --num_nodes "${NUM_NODES}" \
+    --num_gpus "${NUM_GPUS}" \
+    --master_addr "${MASTER_ADDR}" \
+    --master_port "${MASTER_PORT}" \
+    "${TRAIN_SCRIPT}" ${TRAIN_ARGS}
+else
+  # Validate deepspeed is importable in the current Python env
+  if ! "${DS_PYTHON_EXEC}" -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('deepspeed') else 1)" >/dev/null 2>&1; then
+    echo "[error] 'deepspeed' not found: neither CLI in PATH nor Python module in ${DS_PYTHON_EXEC}." >&2
+    echo "[hint] Activate the correct environment (e.g., 'pip install deepspeed' in this env) or set DEEPSPEED_BIN to the CLI path." >&2
+    exit 1
+  fi
+  echo "[warn] 'deepspeed' CLI not found in PATH; falling back to 'python -m deepspeed.launcher.launch'." >&2
+  "${DS_PYTHON_EXEC}" -u -m deepspeed.launcher.launch \
+    --hostfile "${HOSTFILE}" \
+    --num_nodes "${NUM_NODES}" \
+    --num_gpus "${NUM_GPUS}" \
+    --master_addr "${MASTER_ADDR}" \
+    --master_port "${MASTER_PORT}" \
+    "${TRAIN_SCRIPT}" ${TRAIN_ARGS}
+fi

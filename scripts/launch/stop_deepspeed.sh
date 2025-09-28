@@ -14,7 +14,7 @@ set -euo pipefail
 # - Requires passwordless SSH to all hosts in HOSTFILE.
 # - PATTERN should uniquely match your training python command (avoid killing unrelated jobs).
 
-HOSTFILE=${HOSTFILE:-}
+HOSTFILE=${HOSTFILE:-scripts/launch/hostfile.example}
 PATTERN=${PATTERN:-class/lec4/train_distillation.py}
 
 if [[ -z "${HOSTFILE}" || ! -f "${HOSTFILE}" ]]; then

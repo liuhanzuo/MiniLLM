@@ -140,6 +140,128 @@ class FeedForward(nn.Module):
         return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
 
 
+class MoDRouter(nn.Module):
+    """
+    MoD (Mixture of Depths) Router per recursion step.
+    Each step independently decides which tokens pass through (mask in {0,1}).
+    Supports expert_choice (top-k per step) and sigmoid_threshold routing.
+    """
+
+    def __init__(self, config: LMConfig, nr_steps: int):
+        super().__init__()
+        self.hidden = config.dim
+        self.nr_steps = nr_steps
+        self.routing = config.mor_routing
+        self.cap_ratio = config.mor_cap_ratio
+        self.tau = config.mor_tau
+        self.temperature = config.mor_temperature
+        self.aux_loss_alpha = config.mor_aux_loss_alpha
+
+        # lightweight gate net
+        self.proj = nn.Linear(self.hidden, 1)
+        self.step_embed = nn.Embedding(num_embeddings=nr_steps, embedding_dim=1)
+
+    def _capacity_for_step(self, step: int, total_tokens: int) -> int:
+        if self.cap_ratio is not None and step < len(self.cap_ratio):
+            return max(1, int(round(total_tokens * float(self.cap_ratio[step]))))
+        # default geometric decay: [1.0, 2/3, 1/3, ...]
+        ratios = [max(1.0/(i+1), 0.1) for i in range(self.nr_steps)]
+        r = ratios[step] if step < len(ratios) else 0.1
+        return max(1, int(round(total_tokens * r)))
+
+    def forward(self, x: torch.Tensor, step: int):
+        """
+        x: [B,S,H]
+        Returns: gate g in [0,1], mask m in {0,1}, aux_loss
+        """
+        B, S, H = x.shape
+        scores = self.proj(x).squeeze(-1)  # [B,S]
+        scores = scores + self.step_embed.weight[step].view(1, 1)
+        if self.temperature != 1.0:
+            scores = scores / self.temperature
+
+        aux_loss = x.new_zeros(())
+        total_tokens = B * S
+
+        if self.routing == 'expert_choice':
+            # select top-k tokens across (B*S) independently per step
+            k = self._capacity_for_step(step, total_tokens)
+            flat = scores.reshape(-1)  # [B*S]
+            topk_vals, topk_idx = torch.topk(flat, k=k, dim=0)
+            m = torch.zeros_like(flat, dtype=x.dtype)
+            m[topk_idx] = 1.0
+            m = m.view(B, S, 1)
+            g = torch.sigmoid(scores).unsqueeze(-1)  # gate for info only
+            # balance loss
+            if self.aux_loss_alpha > 0 and self.training:
+                target = torch.tensor(k/total_tokens, dtype=x.dtype, device=x.device)
+                used = m.mean()
+                aux_loss = self.aux_loss_alpha * (used - target).pow(2)
+            return g, m, aux_loss
+        else:  # sigmoid_threshold
+            g = torch.sigmoid(scores).unsqueeze(-1)  # [B,S,1]
+            m = (g > self.tau).to(dtype=x.dtype)
+            # capacity enforcement (keep highest gates)
+            cap = self._capacity_for_step(step, total_tokens)
+            if m.sum().item() > cap:
+                flat_g = g.view(-1)
+                topk_vals, topk_idx = torch.topk(flat_g, k=cap, dim=0)
+                m = torch.zeros_like(flat_g, dtype=x.dtype)
+                m[topk_idx] = 1.0
+                m = m.view(B, S, 1)
+            if self.aux_loss_alpha > 0 and self.training:
+                target = torch.tensor(cap/total_tokens, dtype=x.dtype, device=x.device)
+                used = m.mean()
+                aux_loss = self.aux_loss_alpha * (used - target).pow(2)
+            return g, m, aux_loss
+
+
+class MoRFeedForward(nn.Module):
+    """
+    MoR (Mixture of Recursions) FeedForward with shared parameters and per-step routing.
+    Each token can independently choose which recursion steps to pass through.
+    """
+    def __init__(self, config: LMConfig):
+        super().__init__()
+        self.config = config
+        self.nr_steps = config.nr_steps
+        
+        # Shared recursion block (Middle-Cycle: same parameters for all steps)
+        if config.hidden_dim is None:
+            hidden_dim = 4 * config.dim
+            hidden_dim = int(2 * hidden_dim / 3)
+            config.hidden_dim = config.multiple_of * ((hidden_dim + config.multiple_of - 1) // config.multiple_of)
+        
+        self.shared_ffn = nn.ModuleDict({
+            'w1': nn.Linear(config.dim, config.hidden_dim, bias=False),
+            'w2': nn.Linear(config.hidden_dim, config.dim, bias=False),
+            'w3': nn.Linear(config.dim, config.hidden_dim, bias=False)
+        })
+        self.dropout = nn.Dropout(config.dropout)
+        self.router = MoDRouter(config, self.nr_steps)
+        self.aux_loss = 0.0
+
+    def _ffn_forward(self, x):
+        """Shared FFN computation f(x)"""
+        return self.dropout(self.shared_ffn['w2'](F.silu(self.shared_ffn['w1'](x)) * self.shared_ffn['w3'](x)))
+
+    def forward(self, x):
+        """
+        x: [B,S,H]
+        Returns: output after nr_steps recursions with per-step routing
+        """
+        h = x
+        self.aux_loss = 0.0
+        
+        for step in range(self.nr_steps):
+            g_step, m_step, aux_step = self.router(h, step)  # m_step: [B,S,1]
+            y = self._ffn_forward(h)  # shared computation
+            h = h + m_step * y  # h_{step+1} = h_{step} + m_{step} * f(h_{step})
+            self.aux_loss = self.aux_loss + aux_step
+            
+        return h
+
+
 class MoEGate(nn.Module):
     def __init__(self, config: LMConfig):
         super().__init__()
@@ -316,7 +438,14 @@ class MiniLLMBlock(nn.Module):
         self.layer_id = layer_id
         self.attention_norm = RMSNorm(config.dim, eps=config.norm_eps)
         self.ffn_norm = RMSNorm(config.dim, eps=config.norm_eps)
-        self.feed_forward = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
+        
+        # Choose feedforward type: MoR, MoE, or standard
+        if config.use_mor:
+            self.feed_forward = MoRFeedForward(config)
+        elif config.use_moe:
+            self.feed_forward = MOEFeedForward(config)
+        else:
+            self.feed_forward = FeedForward(config)
 
     def forward(self, x, pos_cis, past_key_value=None, use_cache=False):
         h_attn, past_kv = self.attention(
@@ -395,19 +524,37 @@ class MiniLLMLM(PreTrainedModel):
         h = self.dropout(self.tok_embeddings(input_ids))
         pos_cis = self.pos_cis[start_pos:start_pos + input_ids.size(1)]
         past_kvs = []
+        use_ckpt = bool(getattr(self.params, 'gradient_checkpointing', False)) and self.training and (h.requires_grad)
+        if use_ckpt:
+            from torch.utils.checkpoint import checkpoint
         for l, layer in enumerate(self.layers):
-            h, past_kv = layer(
-                h, pos_cis,
-                past_key_value=past_key_values[l],
-                use_cache=use_cache
-            )
-            past_kvs.append(past_kv)
+            if use_ckpt:
+                # checkpoint 只支持 Tensor 输出；我们仅对隐状态 h 做检查点，缓存不做检查点以降低复杂度
+                def _layer_fn(x, pos):
+                    out, kv = layer(x, pos, past_key_value=past_key_values[l], use_cache=use_cache)
+                    # 将 kv 暂存到外部列表，保持与未 checkpoint 时一致
+                    past_kvs.append(kv)
+                    return out
+                h = checkpoint(_layer_fn, h, pos_cis, use_reentrant=False)
+            else:
+                h, past_kv = layer(
+                    h, pos_cis,
+                    past_key_value=past_key_values[l],
+                    use_cache=use_cache
+                )
+                past_kvs.append(past_kv)
         logits = self.output(self.norm(h))
         # When layers are shared, aux_loss should be accumulated once per unique block per call.
         if hasattr(self, 'layers_unique'):
-            aux_loss = sum(b.feed_forward.aux_loss for b in self.layers_unique if isinstance(b.feed_forward, MOEFeedForward))
+            aux_loss = sum(
+                b.feed_forward.aux_loss for b in self.layers_unique 
+                if isinstance(b.feed_forward, (MOEFeedForward, MoRFeedForward))
+            )
         else:
-            aux_loss = sum(l.feed_forward.aux_loss for l in self.layers if isinstance(l.feed_forward, MOEFeedForward))
+            aux_loss = sum(
+                l.feed_forward.aux_loss for l in self.layers 
+                if isinstance(l.feed_forward, (MOEFeedForward, MoRFeedForward))
+            )
         self.OUT.__setitem__('logits', logits)
         self.OUT.__setitem__('aux_loss', aux_loss)
         self.OUT.__setitem__('past_key_values', past_kvs)

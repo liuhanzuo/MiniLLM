@@ -20,6 +20,8 @@ class LMConfig(PretrainedConfig):
         rope_theta: int = 1e6,
         dropout: float = 0.2,
         flash_attn: bool = True,
+        # Memory: activation checkpointing
+        gradient_checkpointing: bool = False,
         # Layer sharing / repeat depth
         repeat_layer: bool = False,
         ####################################################
@@ -35,6 +37,17 @@ class LMConfig(PretrainedConfig):
         aux_loss_alpha: float = 0.1,
         seq_aux: bool = True,
         norm_topk_prob: bool = True,
+        ####################################################
+        # Here are the specific configurations of MoR
+        # When use_mor is false, the following is invalid
+        ####################################################
+        use_mor: bool = False,
+        nr_steps: int = 3,
+        mor_routing: str = 'expert_choice',
+        mor_cap_ratio: Optional[List[float]] = None,
+        mor_tau: float = 0.5,
+        mor_temperature: float = 1.0,
+        mor_aux_loss_alpha: float = 0.1,
         **kwargs,
     ):
         self.dim = dim
@@ -51,6 +64,7 @@ class LMConfig(PretrainedConfig):
         self.rope_theta = rope_theta
         self.dropout = dropout
         self.flash_attn = flash_attn
+        self.gradient_checkpointing = gradient_checkpointing
         # Layer sharing / repeat depth
         self.repeat_layer = repeat_layer
         ####################################################
@@ -65,4 +79,15 @@ class LMConfig(PretrainedConfig):
         self.aux_loss_alpha = aux_loss_alpha  # 辅助损失的alpha参数
         self.seq_aux = seq_aux  # 是否在序列级别上计算辅助损失
         self.norm_topk_prob = norm_topk_prob  # 是否标准化top-k概率
+        ####################################################
+        # Here are the specific configurations of MoR
+        # When use_mor is false, the following is invalid
+        ####################################################
+        self.use_mor = use_mor
+        self.nr_steps = nr_steps  # 递归步数
+        self.mor_routing = mor_routing  # MoD路由策略: expert_choice, sigmoid_threshold
+        self.mor_cap_ratio = mor_cap_ratio  # 每步容量比例列表，例如 [1.0, 0.67, 0.33]
+        self.mor_tau = mor_tau  # sigmoid阈值（仅sigmoid_threshold路由使用）
+        self.mor_temperature = mor_temperature  # softmax温度
+        self.mor_aux_loss_alpha = mor_aux_loss_alpha  # MoR均衡损失权重
         super().__init__(**kwargs)

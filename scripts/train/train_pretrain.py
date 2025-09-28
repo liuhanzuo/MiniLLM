@@ -142,12 +142,46 @@ if __name__ == "__main__":
     parser.add_argument('--max_seq_len', default=512, type=int)
     parser.add_argument('--use_moe', default=False, type=bool)
     parser.add_argument('--repeat_layer', action='store_true', help='Enable layer parameter sharing pattern 0,1,2,3,1,2,3,4')
+    parser.add_argument('--gradient_checkpointing', action='store_true', help='Enable activation checkpointing to reduce memory')
+    # MoR arguments
+    parser.add_argument('--use_mor', action='store_true', help='Enable MoR (Mixture of Recursions)')
+    parser.add_argument('--nr_steps', default=3, type=int, help='Number of recursion steps for MoR')
+    parser.add_argument('--mor_routing', default='expert_choice', type=str, choices=['expert_choice', 'sigmoid_threshold'], help='MoD routing strategy')
+    parser.add_argument('--mor_cap_ratio', default=None, type=str, help='Comma-separated capacity ratios per step, e.g., 1.0,0.67,0.33')
+    parser.add_argument('--mor_tau', default=0.5, type=float, help='Sigmoid threshold for MoD routing')
+    parser.add_argument('--mor_temperature', default=1.0, type=float, help='Temperature for MoD routing')
+    parser.add_argument('--mor_aux_loss_alpha', default=0.1, type=float, help='MoR balance loss weight')
     parser.add_argument("--data_path", type=str, default="./dataset/pretrain_hq.jsonl")
     parser.add_argument("--tokenizer_dir", type=str, default="./model/minillm_tokenizer")
     parser.add_argument("--trust_remote_code", action="store_true")
     args = parser.parse_args()
 
-    lm_config = LMConfig(dim=args.dim, n_layers=args.n_layers, n_block=args.n_block, max_seq_len=args.max_seq_len, use_moe=args.use_moe, repeat_layer=args.repeat_layer)
+    # Parse MoR capacity ratios
+    mor_cap_ratio = None
+    if args.mor_cap_ratio:
+        try:
+            mor_cap_ratio = [float(x.strip()) for x in args.mor_cap_ratio.split(',') if x.strip()]
+        except ValueError:
+            print(f"Warning: Invalid mor_cap_ratio format '{args.mor_cap_ratio}', using default")
+            mor_cap_ratio = None
+
+    lm_config = LMConfig(
+        dim=args.dim, 
+        n_layers=args.n_layers, 
+        n_block=args.n_block, 
+        max_seq_len=args.max_seq_len, 
+        use_moe=args.use_moe, 
+        repeat_layer=args.repeat_layer, 
+        gradient_checkpointing=args.gradient_checkpointing,
+        # MoR parameters
+        use_mor=args.use_mor,
+        nr_steps=args.nr_steps,
+        mor_routing=args.mor_routing,
+        mor_cap_ratio=mor_cap_ratio,
+        mor_tau=args.mor_tau,
+        mor_temperature=args.mor_temperature,
+        mor_aux_loss_alpha=args.mor_aux_loss_alpha
+    )
     args.save_dir = os.path.join(args.out_dir)
     os.makedirs(args.save_dir, exist_ok=True)
     os.makedirs(args.out_dir, exist_ok=True)
@@ -173,10 +207,37 @@ if __name__ == "__main__":
     else:
         wandb = None
 
-    # build tokenizer and align vocab size
+    # build tokenizer and align vocab size（包含 added_tokens 与特殊 token）
     tokenizer = build_tokenizer(args.tokenizer_dir, trust_remote_code=args.trust_remote_code)
-    # align vocab_size with tokenizer when constructing model
-    lm_config.vocab_size = tokenizer.vocab_size
+    # ensure pad_token 存在，若无则与 eos 对齐或新增
+    try:
+        if getattr(tokenizer, 'pad_token', None) is None:
+            if getattr(tokenizer, 'eos_token', None) is not None:
+                tokenizer.pad_token = tokenizer.eos_token
+            else:
+                tokenizer.add_special_tokens({'pad_token': '<|pad|>'})
+    except Exception:
+        pass
+
+    def _full_vocab_size(tk):
+        base = int(getattr(tk, 'vocab_size', 0) or 0)
+        try:
+            added = len(getattr(tk, 'get_added_vocab', lambda: {})())
+        except Exception:
+            added = 0
+        max_special = 0
+        try:
+            sp = getattr(tk, 'all_special_ids', None)
+            if sp:
+                max_special = max(sp) + 1
+        except Exception:
+            max_special = 0
+        return max(base + added, max_special)
+
+    lm_config.vocab_size = _full_vocab_size(tokenizer)
+    Logger(f"Tokenizer sizes -> vocab_size:{getattr(tokenizer, 'vocab_size', None)}, added:{len(getattr(tokenizer, 'get_added_vocab', lambda: {})()) if hasattr(tokenizer, 'get_added_vocab') else 'NA'}, all_special_max:{(max(tokenizer.all_special_ids)+1) if getattr(tokenizer, 'all_special_ids', None) else 'NA'}, used:{lm_config.vocab_size}")
+    Logger(f"Gradient checkpointing: {'ON' if args.gradient_checkpointing else 'OFF'}")
+    Logger(f"MoR: {'ON' if args.use_mor else 'OFF'}{f' (steps={args.nr_steps}, routing={args.mor_routing})' if args.use_mor else ''}")
     model, _tokenizer = init_model(lm_config, tokenizer)
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=lm_config.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if ddp else None

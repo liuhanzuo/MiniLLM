@@ -22,7 +22,7 @@ if _ROOT not in sys.path:
 from torch import optim, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from model.tokenizer_utils import build_tokenizer
 from model.model import MiniLLMLM
 from model.LMConfig import LMConfig
@@ -94,69 +94,8 @@ def update_ema_teacher(ema_model: nn.Module, student_model: nn.Module, decay: fl
     for p_ema, p in zip(ema_model.parameters(), sm.parameters()):
         p_ema.data.mul_(decay).add_(p.data, alpha=(1.0 - decay))
 
-# ---------------------- Distillation helpers ----------------------
-def kl_logit_distill(student_logits: torch.Tensor,
-                     teacher_logits: torch.Tensor,
-                     temperature: float = 1.0,
-                     reduction: str = 'batchmean') -> torch.Tensor:
-    """KL(student||teacher) with temperature, on last dim.
-    Shapes: [..., V]. Returns scalar by default (batchmean).
-    """
-    with torch.no_grad():
-        teacher_probs = F.softmax(teacher_logits / temperature, dim=-1).detach()
-    student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
-    kl = F.kl_div(student_log_probs, teacher_probs, reduction=reduction)
-    return (temperature ** 2) * kl
-
-
-def hard_response_distill(student_logits: torch.Tensor,
-                          teacher_logits: torch.Tensor,
-                          reduction: str = 'mean') -> torch.Tensor:
-    """Cross-entropy to teacher argmax tokens (response-based / hard-label KD)."""
-    with torch.no_grad():
-        hard = teacher_logits.argmax(dim=-1)
-    loss = F.cross_entropy(student_logits.transpose(1, 2), hard, reduction=reduction)
-    return loss
-
-
-class FeatureCollector:
-    """Register forward hooks on selected transformer blocks to collect hidden states."""
-    def __init__(self, model: nn.Module, layer_indices: List[int]):
-        self.model = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-        self.layer_indices = layer_indices
-        self.outputs: Dict[int, torch.Tensor] = {}
-        self._hooks: List[Any] = []
-        # Assume MiniLLMLM has attribute `.layers` (ModuleList of MiniLLMBlock)
-        layers = getattr(self.model, 'layers', None)
-        assert layers is not None, "Model must expose .layers"
-        for idx in layer_indices:
-            assert 0 <= idx < len(layers), f"Layer index {idx} out of range"
-            def make_hook(i):
-                def hook(module, inp, out):
-                    # out is (h, past_kv) for MiniLLMBlock.forward return; but hook on block returns its output (tuple).
-                    # Safer: hook at module output via register_forward_hook gives the returned value.
-                    if isinstance(out, tuple):
-                        self.outputs[i] = out[0].detach()
-                    else:
-                        self.outputs[i] = out.detach()
-                return hook
-            h = layers[idx].register_forward_hook(make_hook(idx))
-            self._hooks.append(h)
-
-    def clear(self):
-        self.outputs.clear()
-
-    def close(self):
-        for h in self._hooks:
-            h.remove()
-        self._hooks.clear()
-
-
-@torch.no_grad()
-def update_ema_teacher(ema_model: nn.Module, student_model: nn.Module, decay: float) -> None:
-    sm = student_model.module if isinstance(student_model, torch.nn.parallel.DistributedDataParallel) else student_model
-    for p_ema, p in zip(ema_model.parameters(), sm.parameters()):
-        p_ema.data.mul_(decay).add_(p.data, alpha=(1.0 - decay))
+## Remove duplicated helper block above (deduped)
+##
 
 
 def Logger(content):
@@ -168,14 +107,6 @@ def get_lr(current_step, total_steps, lr):
     return lr / 10 + 0.5 * lr * (1 + math.cos(math.pi * current_step / total_steps))
 
 
-def masked_mean(t: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    # t: [B,T,...], mask: [B,T] in {0,1}
-    mask = mask.float()
-    while t.dim() > mask.dim():
-        mask = mask.unsqueeze(-1)
-    s = (t * mask).sum()
-    d = mask.sum().clamp_min(1.0)
-    return s / d
 def masked_mean(t: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     # t: [B,T,...], mask: [B,T] in {0,1}
     mask = mask.float()
@@ -210,25 +141,20 @@ def train_epoch(epoch, wandb, alpha=0.0, temperature=1.0):
 
         # 教师模型前向传播（只在eval & no_grad）
         teacher_logits = None
-        if args.distillation_mode in {"logit", "response", "feature", "self"}:
-            if teacher_model is not None:
-                with torch.no_grad():
+        if args.distillation_mode in {"logit", "response", "feature", "self"} and teacher_model is not None:
+            with torch.no_grad():
+                if getattr(args, 'teacher_model_type', 'mini') == 'hf':
+                    # HF teacher forward
                     tout = teacher_model(X)
-                    teacher_logits = tout.logits
-                    # 对齐词表
-                    vocab_size_student = student_logits.size(-1)
-                    if teacher_logits.size(-1) != vocab_size_student:
-                        teacher_logits = teacher_logits[..., :vocab_size_student]
-        teacher_logits = None
-        if args.distillation_mode in {"logit", "response", "feature", "self"}:
-            if teacher_model is not None:
-                with torch.no_grad():
+                    tlogits = tout.logits
+                else:
                     tout = teacher_model(X)
-                    teacher_logits = tout.logits
-                    # 对齐词表
-                    vocab_size_student = student_logits.size(-1)
-                    if teacher_logits.size(-1) != vocab_size_student:
-                        teacher_logits = teacher_logits[..., :vocab_size_student]
+                    tlogits = tout.logits
+                # 对齐词表到学生
+                vocab_size_student = student_logits.size(-1)
+                if tlogits.size(-1) != vocab_size_student:
+                    tlogits = tlogits[..., :vocab_size_student]
+                teacher_logits = tlogits
 
         # ========== 计算损失 ==========
         # 1) Ground-Truth CE Loss（可选）
@@ -243,7 +169,7 @@ def train_epoch(epoch, wandb, alpha=0.0, temperature=1.0):
         if lm_config_student.use_moe:
             ce_loss += res.aux_loss
 
-        # 2) Distillation Loss（根据模式）
+    # 2) Distillation Loss（根据模式）
         distill_loss = torch.tensor(0.0, device=args.device)
         mode = args.distillation_mode
         if mode == 'logit' and teacher_logits is not None:
@@ -265,68 +191,58 @@ def train_epoch(epoch, wandb, alpha=0.0, temperature=1.0):
             distill_loss = torch.sum(token_ce * loss_mask_flat) / loss_mask_flat.sum()
         elif mode in {'feature', 'self'}:
             # 收集中间层表示并做 MSE 对齐（如维度不同，使用线性投影）
-            layers = select_feat_layers(len_layers=len(getattr(model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model, 'layers')), k=args.feature_layers)
-            stu_fc = FeatureCollector(model, layers)
-            tea_fc = FeatureCollector(teacher_model if teacher_model is not None else model, layers)
-            with torch.no_grad():
-                _ = (teacher_model(X) if teacher_model is not None else model(X))
-            _ = model(X)  # 学生需要参与梯度，这里 forward 以触发钩子，但我们已拿到 logits；再 forward 一次开销可接受于 demo
-            feat_loss = 0.0
-            for li in layers:
-                s = stu_fc.outputs[li]  # [B,T,Ds]
-                t = tea_fc.outputs[li]  # [B,T,Dt]
-                if s.size(-1) != t.size(-1):
-                    t = feature_project(t, t.size(-1), s.size(-1))
-                feat_loss = feat_loss + masked_mean(F.mse_loss(s, t, reduction='none'), loss_mask)
-            distill_loss = feat_loss / max(1, len(layers))
-            stu_fc.close(); tea_fc.close()
+            # 对 HF 教师：优先使用 hidden_states（需模型开启输出）
+            feat_loss = torch.tensor(0.0, device=args.device)
+            try:
+                len_layers = len(getattr(model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model, 'layers'))
+                layers = select_feat_layers(len_layers=len_layers, k=args.feature_layers)
+                stu_fc = FeatureCollector(model, layers)
+                # 教师为 HF 时，尝试开启输出 hidden_states
+                if getattr(args, 'teacher_model_type', 'mini') == 'hf':
+                    # 重新前向以取 hidden_states
+                    with torch.no_grad():
+                        tout2 = teacher_model(X, output_hidden_states=True, use_cache=False)
+                        t_hs = list(tout2.hidden_states) if tout2.hidden_states is not None else []
+                    # 学生 forward 触发 hook
+                    _ = model(X)
+                    for li in layers:
+                        s = stu_fc.outputs[li]
+                        if li < len(t_hs):
+                            t = t_hs[li]
+                        else:
+                            t = t_hs[-1] if len(t_hs) > 0 else None
+                        if t is None:
+                            continue
+                        if s.size(-1) != t.size(-1):
+                            t = feature_project(t, t.size(-1), s.size(-1))
+                        feat_loss = feat_loss + masked_mean(F.mse_loss(s, t, reduction='none'), loss_mask)
+                    stu_fc.close()
+                else:
+                    tea_fc = FeatureCollector(teacher_model if teacher_model is not None else model, layers)
+                    with torch.no_grad():
+                        _ = (teacher_model(X) if teacher_model is not None else model(X))
+                    _ = model(X)
+                    for li in layers:
+                        s = stu_fc.outputs[li]
+                        t = tea_fc.outputs[li]
+                        if s.size(-1) != t.size(-1):
+                            t = feature_project(t, t.size(-1), s.size(-1))
+                        feat_loss = feat_loss + masked_mean(F.mse_loss(s, t, reduction='none'), loss_mask)
+                    stu_fc.close(); tea_fc.close()
+                distill_loss = feat_loss / max(1, int(args.feature_layers) if int(args.feature_layers) > 0 else 1)
+            except Exception as e:
+                Logger(f"[feature distill] 回退到 logit 蒸馏，原因: {e}")
+                if teacher_logits is not None:
+                    v = min(student_logits.size(-1), teacher_logits.size(-1))
+                    st_flat = student_logits[..., :v].contiguous().view(-1, v)
+                    te_flat = teacher_logits[..., :v].contiguous().view(-1, v)
+                    m = (loss_mask.view(-1) == 1)
+                    distill_loss = kl_logit_distill(st_flat[m], te_flat[m], temperature=temperature)
 
-        # 3) 总损失 = alpha * CE + (1-alpha) * Distill（若无 teacher 则退化为纯 CE）
-        if teacher_model is None and mode != 'self':
-            loss = ce_loss
-        # 2) Distillation Loss（根据模式）
-        distill_loss = torch.tensor(0.0, device=args.device)
-        mode = args.distillation_mode
-        if mode == 'logit' and teacher_logits is not None:
-            v = min(student_logits.size(-1), teacher_logits.size(-1))
-            st_flat = student_logits[..., :v].contiguous().view(-1, v)
-            te_flat = teacher_logits[..., :v].contiguous().view(-1, v)
-            m = (loss_mask_flat == 1)
-            distill_loss = kl_logit_distill(st_flat[m], te_flat[m], temperature=temperature)
-        elif mode == 'response' and teacher_logits is not None:
-            # 硬标签：teacher argmax。按有效 token 掩码聚合
-            v = min(student_logits.size(-1), teacher_logits.size(-1))
-            with torch.no_grad():
-                hard = teacher_logits[..., :v].argmax(dim=-1)
-            token_ce = F.cross_entropy(
-                student_logits[..., :v].contiguous().view(-1, v),
-                hard.view(-1),
-                reduction='none'
-            )
-            distill_loss = torch.sum(token_ce * loss_mask_flat) / loss_mask_flat.sum()
-        elif mode in {'feature', 'self'}:
-            # 收集中间层表示并做 MSE 对齐（如维度不同，使用线性投影）
-            layers = select_feat_layers(len_layers=len(getattr(model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model, 'layers')), k=args.feature_layers)
-            stu_fc = FeatureCollector(model, layers)
-            tea_fc = FeatureCollector(teacher_model if teacher_model is not None else model, layers)
-            with torch.no_grad():
-                _ = (teacher_model(X) if teacher_model is not None else model(X))
-            _ = model(X)  # 学生需要参与梯度，这里 forward 以触发钩子，但我们已拿到 logits；再 forward 一次开销可接受于 demo
-            feat_loss = 0.0
-            for li in layers:
-                s = stu_fc.outputs[li]  # [B,T,Ds]
-                t = tea_fc.outputs[li]  # [B,T,Dt]
-                if s.size(-1) != t.size(-1):
-                    t = feature_project(t, t.size(-1), s.size(-1))
-                feat_loss = feat_loss + masked_mean(F.mse_loss(s, t, reduction='none'), loss_mask)
-            distill_loss = feat_loss / max(1, len(layers))
-            stu_fc.close(); tea_fc.close()
-
-        # 3) 总损失 = alpha * CE + (1-alpha) * Distill（若无 teacher 则退化为纯 CE）
+        # 3) 总损失 = alpha * CE + (1-alpha) * Distill（若无 teacher 则退化为纯 CE；self 模式保留 distill 分量）
         if teacher_model is None and mode != 'self':
             loss = ce_loss
         else:
-            loss = alpha * ce_loss + (1 - alpha) * distill_loss
             loss = alpha * ce_loss + (1 - alpha) * distill_loss
 
         scaler.scale(loss).backward()
@@ -337,10 +253,6 @@ def train_epoch(epoch, wandb, alpha=0.0, temperature=1.0):
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
-
-            # EMA teacher（自蒸馏）在优化器步进后更新
-            if args.distillation_mode == 'self' and teacher_model is not None:
-                update_ema_teacher(teacher_model, model, decay=args.ema_decay)
 
             # EMA teacher（自蒸馏）在优化器步进后更新
             if args.distillation_mode == 'self' and teacher_model is not None:
@@ -361,14 +273,13 @@ def train_epoch(epoch, wandb, alpha=0.0, temperature=1.0):
             )
 
         if (wandb is not None) and (not ddp or dist.get_rank() == 0):
-                wandb.log({
-                    "loss": loss.item(),
-                    "ce_loss": ce_loss.item(),
-            "distill_loss": distill_loss.item() if (teacher_model is not None or args.distillation_mode == 'self') else 0.0,
-            "distill_loss": distill_loss.item() if (teacher_model is not None or args.distillation_mode == 'self') else 0.0,
-                    "lr": optimizer.param_groups[-1]['lr'],
-                    "last-time": spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60
-                })
+            wandb.log({
+                "loss": loss.item(),
+                "ce_loss": ce_loss.item(),
+                "distill_loss": distill_loss.item() if (teacher_model is not None or args.distillation_mode == 'self') else 0.0,
+                "lr": optimizer.param_groups[-1]['lr'],
+                "last-time": spend_time / (step + 1) * iter_per_epoch // 60 - spend_time // 60
+            })
 
         if (step + 1) % args.save_interval == 0 and (not ddp or dist.get_rank() == 0):
             model.eval()
@@ -422,18 +333,46 @@ def init_teacher_model(lm_config):
         ema.eval().to(args.device)
         return ema
     else:
-        model_t = MiniLLMLM(lm_config)
-        moe_path = '_moe' if lm_config.use_moe else ''
-        ckp = args.teacher_ckpt if getattr(args, 'teacher_ckpt', None) else f'./out/full_sft_{lm_config.dim}{moe_path}.pth'
-        if not (ckp and os.path.exists(ckp)):
-            raise FileNotFoundError(f"未找到教师权重: {ckp}. 请通过 --teacher_ckpt 指定，或确保默认路径存在。")
-        state_dict = torch.load(ckp, map_location=args.device)
-        model_t.load_state_dict(state_dict, strict=False)
-        Logger(f'教师模型已从 {ckp} 加载权重')
-        Logger(f'教师模型(LLM)总参数量：{sum(p.numel() for p in model_t.parameters() if p.requires_grad) / 1e6:.3f} 百万, dim={lm_config.dim}, layers={lm_config.n_layers}')
-        model_t = model_t.to(args.device)
-        Logger(model_t)
-        return model_t
+        # 支持两类教师：MiniLLM（默认）与 HF 模型
+        ttype = getattr(args, 'teacher_model_type', 'mini')
+        if ttype == 'hf':
+            Logger('使用 HF 教师模型')
+            # 加载 HF 模型，尽量兼容 remote code
+            def _load_hf(trust_rc: bool):
+                return AutoModelForCausalLM.from_pretrained(
+                    args.teacher_model_name_or_path,
+                    trust_remote_code=trust_rc,
+                    torch_dtype=(torch.bfloat16 if args.dtype == 'bfloat16' else (torch.float16 if args.dtype == 'float16' else None)),
+                )
+            try:
+                model_t = _load_hf(args.trust_remote_code)
+            except Exception as e1:
+                Logger(f"加载 HF 教师失败(trust_remote_code={args.trust_remote_code}): {e1}")
+                Logger("尝试使用 trust_remote_code=True 重新加载…")
+                model_t = _load_hf(True)
+            # 尽量关闭缓存并开启梯度检查点按需
+            try:
+                if hasattr(model_t, 'config'):
+                    model_t.config.use_cache = False
+            except Exception:
+                pass
+            model_t = model_t.to(args.device)
+            Logger(f'教师(HF)参数量：{sum(p.numel() for p in model_t.parameters() if p.requires_grad) / 1e6:.3f} 百万')
+            Logger(model_t)
+            return model_t.eval()
+        else:
+            model_t = MiniLLMLM(lm_config)
+            moe_path = '_moe' if lm_config.use_moe else ''
+            ckp = args.teacher_ckpt if getattr(args, 'teacher_ckpt', None) else f'./out/full_sft_{lm_config.dim}{moe_path}.pth'
+            if not (ckp and os.path.exists(ckp)):
+                raise FileNotFoundError(f"未找到教师权重: {ckp}. 请通过 --teacher_ckpt 指定，或确保默认路径存在。")
+            state_dict = torch.load(ckp, map_location=args.device)
+            model_t.load_state_dict(state_dict, strict=False)
+            Logger(f'教师模型已从 {ckp} 加载权重')
+            Logger(f'教师模型(LLM)总参数量：{sum(p.numel() for p in model_t.parameters() if p.requires_grad) / 1e6:.3f} 百万, dim={lm_config.dim}, layers={lm_config.n_layers}')
+            model_t = model_t.to(args.device)
+            Logger(model_t)
+            return model_t
 
 
 def feature_project(x: torch.Tensor, in_dim: int, out_dim: int) -> torch.Tensor:
@@ -476,7 +415,6 @@ def init_distributed_mode():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniLLM Distillation")
-    parser = argparse.ArgumentParser(description="MiniLLM Distillation")
     parser.add_argument("--out_dir", type=str, default="out")
     parser.add_argument("--epochs", type=int, default=6)
     parser.add_argument("--batch_size", type=int, default=32)
@@ -518,6 +456,11 @@ if __name__ == "__main__":
                         help="教师权重路径；未提供时使用 ./out/full_sft_{teacher_dim}[_moe].pth")
     parser.add_argument("--student_random_init", action="store_true",
                         help="强制学生模型随机初始化（即使存在 student_ckpt 也不加载）")
+    # HF 教师模型支持
+    parser.add_argument("--teacher_model_type", type=str, default="mini", choices=["mini","hf"],
+                        help="教师模型类型：mini=MiniLLM 结构；hf=HuggingFace Transformers 模型")
+    parser.add_argument("--teacher_model_name_or_path", type=str, default=None,
+                        help="当 --teacher_model_type=hf 时，指定 HF 模型 repo id 或本地路径（如 Qwen/Qwen2.5-7B-Instruct）")
     # Distillation options
     parser.add_argument("--distillation_mode", type=str, default="logit",
                         choices=["logit", "response", "feature", "self"],
@@ -573,7 +516,6 @@ if __name__ == "__main__":
     # ensure vocab matches tokenizer for both student and teacher
     lm_config_student.vocab_size = tokenizer.vocab_size
     model = init_student_model(lm_config_student)
-    # teacher 根据模式初始化
     # teacher 根据模式初始化
     teacher_model = init_teacher_model(lm_config_teacher)
 
