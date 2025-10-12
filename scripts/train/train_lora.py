@@ -1,15 +1,24 @@
 import os
+import sys
 import platform
 import argparse
 import random
 import time
 import math
 import warnings
+
+# 添加项目根目录到 Python 路径
+sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
+
 import torch.distributed as dist
 from contextlib import nullcontext
 from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from model.tokenizer_utils import build_tokenizer
+try:
+    from model.tokenizer_utils import build_tokenizer
+except Exception:
+    sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
+    from model.tokenizer_utils import build_tokenizer
 from model.model import MiniLLMLM
 from model.LMConfig import LMConfig
 from model.dataset import SFTDataset

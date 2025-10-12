@@ -1,4 +1,5 @@
 import os
+import sys
 import platform
 import argparse
 import time
@@ -13,8 +14,14 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, DistributedSampler
 from contextlib import nullcontext
 
+
+
 from transformers import AutoTokenizer
-from model.tokenizer_utils import build_tokenizer
+try:
+    from model.tokenizer_utils import build_tokenizer
+except Exception:
+    sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
+    from model.tokenizer_utils import build_tokenizer
 
 from model.model import MiniLLMLM
 from model.LMConfig import LMConfig

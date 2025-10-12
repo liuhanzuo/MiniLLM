@@ -74,11 +74,11 @@ def run_once(model: nn.Module, x: torch.Tensor) -> Tuple[float, Optional[float]]
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--layers', type=int, default=24)
+    ap.add_argument('--layers', type=int, default=8)
     ap.add_argument('--bs', type=int, default=8, help='batch size')
-    ap.add_argument('--seq', type=int, default=1024, help='sequence length')
-    ap.add_argument('--hid', type=int, default=2048, help='hidden size')
-    ap.add_argument('--ff', type=int, default=8192, help='ffn inner size')
+    ap.add_argument('--seq', type=int, default=256, help='sequence length')
+    ap.add_argument('--hid', type=int, default=256, help='hidden size')
+    ap.add_argument('--ff', type=int, default=1024, help='ffn inner size')
     ap.add_argument('--use_ckpt', type=int, default=0, help='0/1 是否启用激活检查点')
     args = ap.parse_args()
 

@@ -2,7 +2,14 @@
 本项目提供一个轻量级的 LLM 训练/微调/对齐与推理框架，并支持快速切换 Hugging Face 的分词器。
 ## 安装环境依赖
 ```bash
+conda create -n minillm python=3.9 -y
+conda activate minillm
 conda install -c conda-forge pyarrow
+
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+50系显卡用户:
+pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128
+
 pip install -r requirements.txt
 ```
 
@@ -128,4 +135,11 @@ python eval_model.py \
 - Windows PowerShell 下命令使用 `python` 调用；Linux/Mac 可用 `python3`。
 
 ## 数据说明
-本仓库示例数据配置引用了社区公开数据与模板，你可以在 `dataset/` 目录中放置自己的数据集，并通过上述参数启动训练与对齐流程。
+本仓库的数据集引用自开源社区minimind， 可以从这里直接下载数据集：https://www.modelscope.cn/datasets/gongjy/minimind_dataset/files
+或者运行以下命令：
+```
+pip install modelscope
+pip install datasets
+modelscope download --dataset gongjy/minimind_dataset --local_dir ./data
+```
+这会将对应的数据集下载到当前目录的data文件夹下。

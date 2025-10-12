@@ -23,7 +23,11 @@ from torch import optim, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
-from model.tokenizer_utils import build_tokenizer
+try:
+    from model.tokenizer_utils import build_tokenizer
+except Exception:
+    sys.path.append(os.path.join(os.path.dirname(__file__), '../..'))
+    from model.tokenizer_utils import build_tokenizer
 from model.model import MiniLLMLM
 from model.LMConfig import LMConfig
 from model.dataset import SFTDataset
