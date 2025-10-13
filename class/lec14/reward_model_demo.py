@@ -117,7 +117,7 @@ def train(args):
     try:
         tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_dir)
     except Exception:
-        tokenizer = AutoTokenizer.from_pretrained('gpt2')
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_dir or 'distilgpt2')
 
     # Ensure tokenizer has a pad_token. Prefer pointing pad_token to eos_token to avoid resizing embeddings.
     pad_added = False
@@ -130,8 +130,35 @@ def train(args):
             pad_added = True
 
     ds = PreferenceDataset(args.data_path, tokenizer, max_len=args.max_seq_len)
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True,
-                        collate_fn=lambda b: collate_fn(b, tokenizer, args.max_seq_len))
+
+    # split train / val
+    total = len(ds)
+    val_size = int(total * args.val_split) if args.val_split > 0 else 0
+    indices = list(range(total))
+    import random
+    random.seed(args.seed)
+    random.shuffle(indices)
+    val_idx = set(indices[:val_size])
+    train_idx = indices[val_size:]
+
+    def make_subset(indices_list):
+        class SubsetDataset:
+            def __init__(self, ds, idxs):
+                self.ds = ds
+                self.idxs = idxs
+            def __len__(self):
+                return len(self.idxs)
+            def __getitem__(self, i):
+                return self.ds[self.idxs[i]]
+        return SubsetDataset(ds, indices_list)
+
+    train_ds = make_subset(train_idx)
+    val_ds = make_subset(list(val_idx)) if val_size > 0 else None
+
+    loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
+                        collate_fn=lambda b: collate_fn(b, tokenizer, args.max_seq_len), num_workers=0)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
+                        collate_fn=lambda b: collate_fn(b, tokenizer, args.max_seq_len), num_workers=0) if val_ds is not None else None
 
     # RewardModel uses AutoModel - define it here to capture imports
     class RewardModelLocal(nn.Module):
@@ -153,7 +180,6 @@ def train(args):
 
     model = RewardModelLocal(backbone_name=args.base_model)
     model.to(device)
-
     # If we added a pad token we must resize the backbone embeddings
     if pad_added:
         try:
@@ -162,11 +188,19 @@ def train(args):
             # not all model classes implement resize_token_embeddings; if so, warn and continue
             print('Warning: could not resize token embeddings for backbone; you may see shape mismatch')
 
-    optim = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    # freeze backbone if only training head
+    if not args.train_backbone:
+        for p in model.backbone.parameters():
+            p.requires_grad = False
+
+    optim = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
+
+    best_val_acc = -1.0
 
     model.train()
     for epoch in range(args.epochs):
         total_loss = 0.0
+        model.train()
         for step, batch in enumerate(loader):
             w_ids = batch['w_input_ids'].to(device)
             w_att = batch['w_attention_mask'].to(device)
@@ -175,7 +209,19 @@ def train(args):
 
             r_w = model(w_ids, w_att)
             r_l = model(l_ids, l_att)
-            loss = pairwise_loss(r_w, r_l, torch)
+
+            # scaled pairwise logistic loss
+            diff = (r_w - r_l) / (args.temperature + 1e-12)
+            loss_rank = - torch.log(torch.sigmoid(diff) + 1e-12).mean()
+            # hinge margin loss to enforce margin
+            hinge = torch.relu(args.margin - diff).mean()
+            # L2 regularization on head to stabilize scores
+            l2 = 0.0
+            for p in model.head.parameters():
+                l2 = l2 + (p ** 2).sum()
+            l2 = l2 * (args.head_l2 / (sum(p.numel() for p in model.head.parameters()) + 1e-12))
+
+            loss = loss_rank + args.hinge_w * hinge + l2
 
             optim.zero_grad()
             loss.backward()
@@ -185,13 +231,107 @@ def train(args):
             if (step + 1) % args.log_interval == 0:
                 print(f"Epoch {epoch} step {step+1}/{len(loader)} loss={total_loss/(step+1):.4f}")
 
-        print(f"Epoch {epoch} finished, avg loss={total_loss/len(loader):.4f}")
+        avg_loss = total_loss / max(1, len(loader))
+        print(f"Epoch {epoch} finished, avg loss={avg_loss:.4f}")
+
+        # validation
+        if val_loader is not None:
+            model.eval()
+            correct = 0
+            total_v = 0
+            with torch.no_grad():
+                for vb in val_loader:
+                    w_ids = vb['w_input_ids'].to(device)
+                    w_att = vb['w_attention_mask'].to(device)
+                    l_ids = vb['l_input_ids'].to(device)
+                    l_att = vb['l_attention_mask'].to(device)
+                    r_w = model(w_ids, w_att)
+                    r_l = model(l_ids, l_att)
+                    correct += (r_w > r_l).sum().item()
+                    total_v += r_w.size(0)
+            val_acc = correct / max(1, total_v)
+            print(f"Validation acc: {val_acc:.4f} ({correct}/{total_v})")
+            # save best head
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                save_path = args.save_path
+                os.makedirs(save_path, exist_ok=True)
+                # Ensure saved head has positive mean(chosen - rejected). If not, flip head sign.
+                try:
+                    # compute mean diff on validation set
+                    mean_diff = 0.0
+                    cnt = 0
+                    for vb in val_loader:
+                        w_ids = vb['w_input_ids'].to(device)
+                        w_att = vb['w_attention_mask'].to(device)
+                        l_ids = vb['l_input_ids'].to(device)
+                        l_att = vb['l_attention_mask'].to(device)
+                        r_w = model(w_ids, w_att)
+                        r_l = model(l_ids, l_att)
+                        mean_diff += (r_w - r_l).sum().item()
+                        cnt += r_w.size(0)
+                    mean_diff = mean_diff / max(1, cnt)
+                except Exception:
+                    mean_diff = None
+
+                # if mean_diff is negative, flip head weights and bias before saving
+                flipped = False
+                if mean_diff is not None and mean_diff < 0:
+                    try:
+                        with torch.no_grad():
+                            for p in model.head.parameters():
+                                p.mul_(-1)
+                        flipped = True
+                    except Exception:
+                        flipped = False
+
+                torch.save({'head_state_dict': model.head.state_dict(), 'backbone_name': args.base_model}, os.path.join(save_path, 'reward_demo_head_best.pth'))
+                print(f"Saved best head (val acc={val_acc:.4f}) to {save_path}/reward_demo_head_best.pth")
+                if mean_diff is not None:
+                    print(f"  val mean (chosen - rejected) = {mean_diff:.6f} (flipped={flipped})")
 
     # save small checkpoint (只保存 head + config 不保存大模型权重以免文件过大)
     save_path = args.save_path
     os.makedirs(save_path, exist_ok=True)
+    # Before final save, double-check sign on a small batch (val if present else first train batch)
+    mean_diff = None
+    try:
+        if val_loader is not None:
+            chk_loader = val_loader
+        else:
+            chk_loader = loader
+        # sample a few batches
+        tot = 0
+        ssum = 0.0
+        for i, vb in enumerate(chk_loader):
+            if i >= 3:
+                break
+            w_ids = vb['w_input_ids'].to(device)
+            w_att = vb['w_attention_mask'].to(device)
+            l_ids = vb['l_input_ids'].to(device)
+            l_att = vb['l_attention_mask'].to(device)
+            r_w = model(w_ids, w_att)
+            r_l = model(l_ids, l_att)
+            ssum += (r_w - r_l).sum().item()
+            tot += r_w.size(0)
+        mean_diff = ssum / max(1, tot)
+    except Exception:
+        mean_diff = None
+
+    flipped = False
+    if mean_diff is not None and mean_diff < 0:
+        try:
+            with torch.no_grad():
+                for p in model.head.parameters():
+                    p.mul_(-1)
+            flipped = True
+        except Exception:
+            flipped = False
+
     torch.save({'head_state_dict': model.head.state_dict(), 'backbone_name': args.base_model}, os.path.join(save_path, 'reward_demo_head.pth'))
     print(f"Saved reward demo head to {save_path}")
+    if mean_diff is not None:
+        print(f"  final mean (chosen - rejected) = {mean_diff:.6f} (flipped={flipped})")
 
 
 def make_dummy_dataset(path: str, n: int = 100):
@@ -220,6 +360,14 @@ def parse_args():
     p.add_argument('--save_path', type=str, default='./class/lec14/out')
     p.add_argument('--log_interval', type=int, default=10)
     p.add_argument('--make_dummy', action='store_true', help='如果没有数据则创建一个小的 demo 数据集')
+    # Additional training hyperparameters / options
+    p.add_argument('--train_backbone', type=int, default=0, help='是否训练 backbone (1) 或只训练 head (0). 默认0 (只训练 head)')
+    p.add_argument('--val_split', type=float, default=0.0, help='训练/验证拆分比例 (0.0 表示不使用验证集)')
+    p.add_argument('--temperature', type=float, default=1.0, help='温度缩放系数, 应用于 r_w - r_l')
+    p.add_argument('--margin', type=float, default=0.0, help='hinge margin, 当 diff < margin 时产生额外损失')
+    p.add_argument('--hinge_w', type=float, default=0.0, help='hinge 损失权重')
+    p.add_argument('--head_l2', type=float, default=0.0, help='对 head 权重的 L2 正则化系数 (缩放后应用)')
+    p.add_argument('--seed', type=int, default=42, help='随机种子，用于 train/val 划分和 shuffle')
     return p.parse_args()
 
 

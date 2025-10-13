@@ -8,3 +8,5 @@
 wandb/
 dist/
 checkpoints/
+class/lec15/out_policy/
+class/lec16/out_*/
