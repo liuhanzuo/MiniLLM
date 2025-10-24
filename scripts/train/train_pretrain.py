@@ -222,7 +222,22 @@ if __name__ == "__main__":
             if getattr(tokenizer, 'eos_token', None) is not None:
                 tokenizer.pad_token = tokenizer.eos_token
             else:
-                tokenizer.add_special_tokens({'pad_token': '<|pad|>'})
+                # Only add a special pad token automatically if tokenizer was loaded from
+                # a remote HF repo (not a local tokenizer dir). For local tokenizers we avoid
+                # changing vocab_size automatically to prevent mismatch with checkpoints.
+                is_local = getattr(tokenizer, '_is_local', None)
+                if is_local is None:
+                    # fallback to checking the path
+                    try:
+                        is_local = os.path.isdir(args.tokenizer_dir)
+                    except Exception:
+                        is_local = False
+
+                if not is_local:
+                    tokenizer.add_special_tokens({'pad_token': '<|pad|>'})
+                else:
+                    # local tokenizer: do not add new token; leave pad unset or mapped earlier
+                    pass
     except Exception:
         pass
 

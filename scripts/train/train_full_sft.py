@@ -175,18 +175,61 @@ def init_model(lm_config):
         Logger(model)
         return model
     else:
-        model = MiniLLMLM(lm_config)
         moe_path = '_moe' if lm_config.use_moe else ''
         if args.ckp is None:
             ckp = f'./out/pretrain_{lm_config.dim}{moe_path}.pth'
         else:
             ckp = args.ckp
+
+        # If a checkpoint exists, inspect its embedding shape first so we can
+        # construct the model with matching vocab size. This avoids RuntimeError
+        # when loading state_dict where checkpoint vocab != tokenizer vocab.
+        ckpt_vocab_size = None
         if ckp is not None and os.path.exists(ckp):
-            print("Loading pretrained model from {}", ckp)
-            state_dict = torch.load(ckp, map_location=args.device)
-            model.load_state_dict(state_dict, strict=False)
+            try:
+                # Load to CPU to inspect shapes without consuming GPU memory
+                _sd = torch.load(ckp, map_location='cpu')
+                # support dict saved as {'module': state_dict} or direct state_dict
+                if isinstance(_sd, dict) and len(_sd) == 1 and any(isinstance(v, dict) for v in _sd.values()):
+                    # find nested dict which is likely the state_dict
+                    for v in _sd.values():
+                        if isinstance(v, dict):
+                            _sd = v
+                            break
+                for k, v in _sd.items():
+                    if not hasattr(v, 'shape'):
+                        continue
+                    # common embedding keys: tok_embeddings.weight, output.weight, lm_head.weight
+                    if k.endswith('tok_embeddings.weight') or k.endswith('tok_emb.weight') or k.endswith('lm_head.weight') or k.endswith('output.weight') or 'embeddings' in k and v.ndim == 2:
+                        try:
+                            if v.ndim == 2:
+                                ckpt_vocab_size = v.shape[0]
+                                break
+                        except Exception:
+                            continue
+            except Exception as e:
+                Logger(f"检查 checkpoint 大小时出错（{ckp}）：{e}")
+
+        # If checkpoint vocabulary differs from current lm_config, override lm_config.vocab_size
+        if ckpt_vocab_size is not None and ckpt_vocab_size != getattr(lm_config, 'vocab_size', None):
+            Logger(f"检测到 checkpoint vocab_size={ckpt_vocab_size}，将覆盖 lm_config.vocab_size (原: {lm_config.vocab_size})")
+            lm_config.vocab_size = ckpt_vocab_size
+
+        # Build model with (possibly updated) lm_config
+        model = MiniLLMLM(lm_config)
+
+        # Try to load checkpoint if present
+        if ckp is not None and os.path.exists(ckp):
+            try:
+                Logger(f"Loading pretrained model from {ckp}")
+                state_dict = torch.load(ckp, map_location=args.device)
+                model.load_state_dict(state_dict, strict=False)
+            except Exception as e:
+                Logger(f"加载预训练权重失败（尝试 strict=False）: {e}")
+                # Do not raise here; permit training from scratch if desired
         else:
             Logger(f"未提供/未找到预训练权重，将从随机初始化开始：{ckp}")
+
         Logger(f'LLM总参数量：{sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f} 百万')
         model = model.to(args.device)
         # Print model structure at start (rank-0 only if DDP)
@@ -282,6 +325,25 @@ if __name__ == "__main__":
 
     # build tokenizer and align vocab
     tokenizer = build_tokenizer(args.tokenizer_dir, trust_remote_code=args.trust_remote_code)
+    # ensure pad_token exists: map to eos if possible; only add new special tokens for remote tokenizers
+    try:
+        if getattr(tokenizer, 'pad_token', None) is None:
+            if getattr(tokenizer, 'eos_token', None) is not None:
+                tokenizer.pad_token = tokenizer.eos_token
+            else:
+                is_local = getattr(tokenizer, '_is_local', None)
+                if is_local is None:
+                    try:
+                        is_local = os.path.isdir(args.tokenizer_dir)
+                    except Exception:
+                        is_local = False
+                if not is_local:
+                    tokenizer.add_special_tokens({'pad_token': '<|pad|>'})
+                else:
+                    pass
+    except Exception:
+        pass
+
     lm_config.vocab_size = tokenizer.vocab_size
     model = init_model(lm_config)
     # HF: 训练建议关闭缓存并可选启用梯度检查点

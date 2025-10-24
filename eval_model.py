@@ -7,6 +7,7 @@ import torch
 import torch.distributed as dist
 import warnings
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from model.tokenizer_utils import build_tokenizer
 from model.model import MiniLLMLM
 from model.LMConfig import LMConfig
 from model.model_lora import *
@@ -15,7 +16,27 @@ warnings.filterwarnings('ignore')
 
 
 def init_model(args, device):
-    tokenizer = AutoTokenizer.from_pretrained('./model/minillm_tokenizer')
+    # Prefer the repo's tokenizer loader which marks local vs remote tokenizers
+    tok_path = args.tokenizer_path if args.tokenizer_path is not None else './model/minillm_tokenizer'
+    tokenizer = build_tokenizer(tok_path)
+
+    # Safe pad token handling: do NOT add special tokens automatically for local tokenizers.
+    # If pad_token is missing, map it to eos or unk where available. Only remote tokenizers
+    # may get auto-added pad tokens by build_tokenizer logic.
+    try:
+        is_local = bool(getattr(tokenizer, '_is_local', False))
+    except Exception:
+        is_local = False
+
+    if tokenizer.pad_token is None:
+        if tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+        elif tokenizer.unk_token is not None:
+            tokenizer.pad_token = tokenizer.unk_token
+        else:
+            # If remote (not local) tokenizer and still missing, allow adding a pad token
+            if not is_local:
+                tokenizer.add_special_tokens({'pad_token': '<pad>'})
     if args.load == 0:
         moe_path = '_moe' if args.use_moe else ''
         modes = {0: 'pretrain', 1: 'full_sft', 2: 'rlhf', 3: 'reason'}
@@ -24,20 +45,40 @@ def init_model(args, device):
         else:
             ckp = f'./{args.out_dir}/{modes[args.model_mode]}_{args.dim}{moe_path}.pth'
 
-        model = MiniLLMLM(LMConfig(
+        # Inspect checkpoint on CPU to determine checkpoint vocab size (if available).
+        # This avoids silent size-mismatch when loading embeddings.
+        ckpt_vocab_size = None
+        if os.path.exists(ckp):
+            try:
+                state_cpu = torch.load(ckp, map_location='cpu', weights_only=True)
+            except TypeError:
+                state_cpu = torch.load(ckp, map_location='cpu')
+
+            for key in ('tok_embeddings.weight', 'lm_head.weight', 'output.weight', 'transformer.wte.weight', 'embed_tokens.weight'):
+                if key in state_cpu:
+                    ckpt_vocab_size = state_cpu[key].shape[0]
+                    break
+
+        lmconf_kwargs = dict(
             dim=args.dim,
             n_layers=args.n_layers,
             n_block=args.n_block,
             max_seq_len=args.max_seq_len,
             use_moe=args.use_moe
-        ))
+        )
+        if ckpt_vocab_size is not None:
+            lmconf_kwargs['vocab_size'] = int(ckpt_vocab_size)
+
+        model = MiniLLMLM(LMConfig(**lmconf_kwargs))
 
         # Prefer safe weights-only when available
         try:
             state_dict = torch.load(ckp, map_location=device, weights_only=True)
         except TypeError:
             state_dict = torch.load(ckp, map_location=device)
-        model.load_state_dict({k: v for k, v in state_dict.items() if 'mask' not in k}, strict=True)
+
+        # Load weights (ignore routing masks if present)
+        model.load_state_dict({k: v for k, v in state_dict.items() if 'mask' not in k}, strict=False)
 
         if args.lora_name != 'None':
             apply_lora(model)

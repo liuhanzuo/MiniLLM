@@ -517,6 +517,25 @@ if __name__ == "__main__":
 
     # 初始化学生模型和教师模型
     tokenizer = build_tokenizer(args.tokenizer_dir, trust_remote_code=args.trust_remote_code)
+    # ensure pad_token exists and avoid changing local tokenizer vocab
+    try:
+        if getattr(tokenizer, 'pad_token', None) is None:
+            if getattr(tokenizer, 'eos_token', None) is not None:
+                tokenizer.pad_token = tokenizer.eos_token
+            else:
+                is_local = getattr(tokenizer, '_is_local', None)
+                if is_local is None:
+                    try:
+                        is_local = os.path.isdir(args.tokenizer_dir)
+                    except Exception:
+                        is_local = False
+                if not is_local:
+                    tokenizer.add_special_tokens({'pad_token': '<|pad|>'})
+                else:
+                    pass
+    except Exception:
+        pass
+
     # ensure vocab matches tokenizer for both student and teacher
     lm_config_student.vocab_size = tokenizer.vocab_size
     model = init_student_model(lm_config_student)

@@ -38,6 +38,18 @@ def build_tokenizer(tokenizer_dir: str, use_fast: bool = True, trust_remote_code
                 use_fast=use_fast,
                 trust_remote_code=True,
             )
+    # mark whether tokenizer was loaded from a local dir
+    try:
+        is_local = os.path.isdir(tokenizer_dir)
+    except Exception:
+        is_local = False
+
+    # attach flag to tokenizer so callers can make decisions
+    try:
+        tok._is_local = is_local
+    except Exception:
+        pass
+
     if tok.pad_token is None:
         # Prefer mapping to an existing special token to avoid increasing vocab size
         if tok.eos_token is not None:
@@ -51,8 +63,16 @@ def build_tokenizer(tokenizer_dir: str, use_fast: bool = True, trust_remote_code
                 if pad_tok is not None:
                     tok.pad_token = pad_tok
                 else:
-                    # Fall back to adding a new pad token (may increase vocab); caller must resize embeddings accordingly
-                    tok.add_special_tokens({'pad_token': '<pad>'})
+                    # If tokenizer is local, do NOT add new special tokens automatically
+                    if not is_local:
+                        # Fall back to adding a new pad token (may increase vocab); caller must resize embeddings accordingly
+                        tok.add_special_tokens({'pad_token': '<pad>'})
+                    else:
+                        # local tokenizer: avoid changing vocab automatically; leave pad_token unset and let caller handle
+                        pass
             except Exception:
-                tok.add_special_tokens({'pad_token': '<pad>'})
+                if not is_local:
+                    tok.add_special_tokens({'pad_token': '<pad>'})
+                else:
+                    pass
     return tok
