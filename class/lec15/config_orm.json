@@ -1,0 +1,47 @@
+{
+  "experiment_name": "grpo_demo_orm",
+  "description": "GRPO训练示例配置 - ORM模式",
+  
+  "model": {
+    "base_model": "gpt2",
+    "tokenizer_dir": "gpt2",
+    "reward_model_path": null
+  },
+  
+  "grpo": {
+    "group_size": 4,
+    "reward_mode": "orm",
+    "clip_epsilon": 0.2,
+    "kl_coef": 0.1,
+    "normalize_advantage": true,
+    "advantage_eps": 1e-8
+  },
+  
+  "training": {
+    "epochs": 1,
+    "batch_size": 2,
+    "lr": 1e-5,
+    "max_seq_len": 128,
+    "max_gen_len": 64,
+    "gradient_accumulation_steps": 1,
+    "max_grad_norm": 1.0
+  },
+  
+  "data": {
+    "data_path": "./class/lec15/demo_prompts.jsonl",
+    "make_dummy": true,
+    "num_dummy_samples": 20
+  },
+  
+  "logging": {
+    "log_interval": 5,
+    "save_path": "./class/lec15/out",
+    "save_interval": 100
+  },
+  
+  "system": {
+    "device": "cuda:0",
+    "seed": 42,
+    "num_workers": 0
+  }
+}
